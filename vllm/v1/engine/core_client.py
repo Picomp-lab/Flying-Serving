@@ -1158,6 +1158,8 @@ class DPAsyncMPClient(AsyncMPClient):
             await self.add_request_async_tp_mode(request)
         elif work_mode == 'manipulated':
             await self.add_request_async_manipulated(request)
+        elif work_mode == 'switch_test':
+            await self.add_request_async_switch_test(request)
         else:
             raise ValueError(f"Invalid work mode: {work_mode}")
         
@@ -1316,6 +1318,76 @@ class DPAsyncMPClient(AsyncMPClient):
         
         self.step_count += 1
         
+
+    async def add_request_async_switch_test(self, request: EngineCoreRequest) -> None:
+        """Deterministic DP<->TP switch exerciser (validation harness).
+
+        The shipped routing policies put their switch points thousands of
+        requests apart (`manipulated` switches at request 1520 and 2600 of
+        4000), which makes the switch paths impractical to cover in a short
+        run -- and is why the DP->TP `hard-preempt` branch went unexercised
+        long enough to be left as a `NotImplementedError`.
+
+        This mode flips the running mode every `VLLM_DTP_SWITCH_PERIOD`
+        requests, using `VLLM_DTP_TO_TP_METHOD` for DP->TP and
+        `VLLM_DTP_TO_DP_METHOD` for TP->DP, so a few hundred requests cover
+        many switches in both directions with both methods.
+
+        It is a test harness, not a serving policy: switching on a fixed
+        request count ignores load entirely.
+        """
+        self._ensure_stats_update_task()
+
+        period = max(1, int(os.environ.get("VLLM_DTP_SWITCH_PERIOD", "40")))
+        to_tp_method = os.environ.get("VLLM_DTP_TO_TP_METHOD", "sequential")
+        to_dp_method = os.environ.get("VLLM_DTP_TO_DP_METHOD", "hard-preempt")
+
+        request.current_wave = self.current_wave
+        request.client_index = self.client_index
+
+        # Start in DP so the first switch is a DP->TP one with DP work in
+        # flight -- the case hard-preempt exists for.
+        if self.step_count > 0 and self.step_count % period == 0:
+            request.switch_running_mode_flag = True
+            if self.running_mode == 'DP':
+                request.switch_mode = 'TP'
+                request.switch_method = to_tp_method
+                self.running_mode = 'TP'
+            else:
+                request.switch_mode = 'DP'
+                request.switch_method = to_dp_method
+                self.running_mode = 'DP'
+            logger.info("switch_test: request %s switches to %s via %s",
+                        request.request_id, request.switch_mode,
+                        request.switch_method)
+        else:
+            request.switch_running_mode_flag = False
+        self.step_count += 1
+
+        # Switch requests always go to every engine: a DP->TP one is the first
+        # request of the merged episode, and a TP->DP one has to be seen by
+        # every engine that is still merged. Only steady-state DP traffic is
+        # routed to a single engine.
+        chosen_engines = self.core_engines
+        if self.running_mode == 'DP' and not request.switch_running_mode_flag:
+            chosen_engines = [self.get_core_engine_for_request_original(request)]
+
+        engine_indices = [self.core_engines.index(e) for e in chosen_engines]
+        request.long_request_engines = engine_indices
+        request.is_long_request = len(chosen_engines) > 1
+        request.long_request_engine_num = len(chosen_engines)
+
+        send_tasks = [
+            self._send_input(EngineCoreRequestType.ADD, request, engine)
+            for engine in chosen_engines
+        ]
+        if not self.engines_running:
+            req_msg = msgspec.msgpack.encode(("FIRST_REQ", chosen_engines[0]))
+            await self.first_req_send_socket.send(req_msg)
+
+        await asyncio.gather(*send_tasks)
+
+        self._ensure_output_queue_task()
 
     async def add_request_async_based_on_traffic_load(self, request: EngineCoreRequest) -> None:
         # In this mode, we will send the request to all the engines, but only the chosen engine

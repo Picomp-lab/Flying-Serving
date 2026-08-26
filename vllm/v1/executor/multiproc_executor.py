@@ -50,6 +50,15 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
 logger = init_logger(__name__)
 
 
+# Sentinel "method" understood by WorkerProc.worker_busy_loop itself rather
+# than dispatched to the Worker. Used to re-point a live worker at a different
+# rpc_broadcast_mq, which is how the merged DTP group gets driven by a single
+# executor: one broadcast reaches every worker of every merged engine instead
+# of each engine broadcasting to its own two workers and then rendezvousing
+# inside the model forward.
+_REATTACH_BROADCAST_MQ = "__vllm_reattach_broadcast_mq__"
+
+
 class MultiprocExecutor(Executor):
     supports_pp: bool = True
 
@@ -116,6 +125,14 @@ class MultiprocExecutor(Executor):
             self.rpc_broadcast_mq.wait_until_ready()
             for w in self.workers:
                 w.worker_response_mq.wait_until_ready()
+
+            if os.environ.get("VLLM_DTP_MQ_SELFTEST", "0") == "1":
+                # Prove the live re-attach path before wiring it into the
+                # DP->TP transition: swap onto an equivalent queue right after
+                # startup. If serving still works, the mechanism is sound.
+                logger.info("MQ self-test: rebuilding rpc_broadcast_mq")
+                self.rebuild_broadcast_mq()
+                logger.info("MQ self-test: rebuild complete")
 
             self.start_worker_monitor()
             success = True
@@ -214,6 +231,45 @@ class MultiprocExecutor(Executor):
             "take_draft_token_ids", unique_reply_rank=self.output_rank
         )
         return outputs[0]
+
+    def rebuild_broadcast_mq(
+        self,
+        handle: Handle | None = None,
+        n_readers: int | None = None,
+        reader_rank_offset: int = 0,
+    ) -> Handle:
+        """Move this executor's workers onto a new rpc_broadcast_mq.
+
+        Pass `handle` to attach to a queue owned by *another* executor (the
+        merged-group leader); this executor then stops being a writer and only
+        re-points its workers. Otherwise a fresh queue is created here and its
+        handle returned so it can be shared with the other engines.
+
+        Ordering matters and mirrors `_init_executor`: every reader must have
+        constructed (which is what sends its subscription) before any writer
+        calls `wait_until_ready`, so the workers reply to the RPC *before* they
+        block on the handshake.
+        """
+        is_writer = handle is None
+        if is_writer:
+            n_readers = n_readers if n_readers is not None else self.world_size
+            max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
+            new_mq = MessageQueue(
+                n_readers, n_readers, max_chunk_bytes=max_chunk_bytes
+            )
+            handle = new_mq.export_handle()
+        else:
+            new_mq = None
+
+        # Sent over the *current* queue; this is the last message on it.
+        self.collective_rpc(
+            _REATTACH_BROADCAST_MQ, args=(handle, reader_rank_offset)
+        )
+
+        if is_writer:
+            self.rpc_broadcast_mq = new_mq
+            self.rpc_broadcast_mq.wait_until_ready()
+        return handle
 
     def collective_rpc(
         self,
@@ -685,6 +741,23 @@ class WorkerProc:
             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
                 cancel=cancel, indefinite=True
             )
+            if method == _REATTACH_BROADCAST_MQ:
+                # Handled here, not on self.worker: it swaps the queue this
+                # loop reads from. Construct (which sends our subscription),
+                # answer on the old response path so the writer can finish its
+                # side of the handshake, and only then block on READY.
+                handle, reader_rank_offset = args
+                new_mq = MessageQueue.create_from_handle(
+                    handle, reader_rank_offset + self.rank
+                )
+                self.handle_output(None)
+                new_mq.wait_until_ready()
+                self.rpc_broadcast_mq = new_mq
+                logger.info(
+                    "Worker rank %d re-attached to broadcast mq as reader %d",
+                    self.rank, reader_rank_offset + self.rank,
+                )
+                continue
             try:
                 if isinstance(method, str):
                     func = getattr(self.worker, method)

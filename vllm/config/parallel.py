@@ -456,14 +456,38 @@ class ParallelConfig:
         return gathered_objects
         
     @staticmethod
-    def sync_TP_requests_number(dp_group: ProcessGroup,
-                                dp_size: int,
-                                dp_rank: int,
-                                TP_requests_number: int):
-        tensor = torch.zeros([dp_size], dtype=torch.int32, device="cpu")
-        tensor[dp_rank] = TP_requests_number
+    def sync_TP_barrier(dp_group: ProcessGroup,
+                        dp_size: int,
+                        dp_rank: int,
+                        TP_requests_number: int,
+                        wants_to_exit: bool) -> tuple[int, bool, bool]:
+        """One all-reduce carrying both halves of the TP-mode lockstep.
+
+        Column 0 is this engine's count of admissible TP requests; the *min*
+        across engines caps admissions, so an engine never admits a request the
+        others do not have yet and every engine builds the same batch.
+
+        Column 1 is its vote to leave TP mode. Both `any` and `all` of the votes
+        are returned: `any` tells every engine to stop admitting (so the merged
+        batches stay identical while the vote converges) and `all` is the signal
+        to flip, which — coming from this collective — lands on the same step
+        everywhere.
+
+        The two ride the *same* collective on purpose. Two separate all-reduces
+        on this group would have to be issued in the same order on every engine,
+        and an engine deciding locally whether to issue one is exactly how the
+        DP<->TP switch deadlocks.
+
+        Returns `(admission_cap, any_engine_wants_to_exit, all_engines_want_to_exit)`.
+        """
+        tensor = torch.zeros([dp_size, 2], dtype=torch.int32, device="cpu")
+        tensor[dp_rank, 0] = TP_requests_number
+        tensor[dp_rank, 1] = 1 if wants_to_exit else 0
         torch.distributed.all_reduce(tensor, op=ReduceOp.SUM, group=dp_group)
-        return tensor.min().item()
+        votes = tensor[:, 1] > 0
+        return (int(tensor[:, 0].min().item()),
+                bool(votes.any().item()),
+                bool(votes.all().item()))
     
     @staticmethod
     def sync_long_request_across_dp_ranks(dp_group: "ProcessGroup",

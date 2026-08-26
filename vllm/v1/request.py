@@ -127,6 +127,12 @@ class Request:
         # The number of requests being preempted by the scheduler
         self.num_preemptions = 0
 
+        # Output tokens that were folded back into the prompt by a DP<->TP
+        # switch preemption (see `reset_output_token_ids`). They are no longer
+        # in `_output_token_ids`, but they were still generated for this
+        # request, so the generation budget has to keep counting them.
+        self.num_folded_output_tokens = 0
+
         self.block_hashes: list[BlockHash] = []
         self.get_hash_new_full_blocks: Callable[[], list[BlockHash]] | None = None
         if block_hasher is not None:
@@ -186,9 +192,30 @@ class Request:
             self.block_hashes.extend(self.get_hash_new_full_blocks())
             
     def reset_output_token_ids(self, token_ids: list[int]) -> None:
+        """Fold already-generated tokens into the prompt.
+
+        Called when a request is preempted across a DP<->TP switch: its KV is
+        dropped (the block layout changes with the merged-engine count), so it
+        has to be re-prefilled. The tokens it already produced become part of
+        the prompt, which both restores its context and stops them from being
+        emitted to the client a second time.
+
+        Callers routinely pass `request._output_token_ids` itself, so copy it
+        before clearing: otherwise `clear()` empties the caller's list and the
+        `extend` below is a no-op, leaving the request with a prompt that is
+        missing everything it had generated while `_all_token_ids` still counts
+        those tokens -- the scheduler then asks the worker to compute over
+        positions the worker was never given.
+        """
+        folded = list(token_ids)
         self._output_token_ids.clear()
-        self.prompt_token_ids.extend(token_ids)
-        self.num_prompt_tokens += len(token_ids)
+        self.prompt_token_ids.extend(folded)
+        self.num_prompt_tokens += len(folded)
+        # `num_output_tokens` must stay the *physical* length of
+        # `_output_token_ids` -- the model runner truncates its own copy against
+        # it -- so the folded tokens are tracked separately and added back only
+        # where the generation budget is enforced (`num_output_tokens_total`).
+        self.num_folded_output_tokens += len(folded)
 
     @property
     def use_structured_output(self) -> bool:
@@ -209,6 +236,16 @@ class Request:
     @property
     def num_output_tokens(self) -> int:
         return len(self._output_token_ids)
+
+    @property
+    def num_output_tokens_total(self) -> int:
+        """Tokens generated over the request's whole lifetime.
+
+        Unlike `num_output_tokens` this survives a DP<->TP switch preemption,
+        so `max_tokens`/`min_tokens` mean the same thing whether or not the
+        request happened to be running when the engines switched mode.
+        """
+        return len(self._output_token_ids) + self.num_folded_output_tokens
 
     def is_finished(self) -> bool:
         return RequestStatus.is_finished(self.status)
