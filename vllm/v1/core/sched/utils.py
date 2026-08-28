@@ -42,9 +42,13 @@ def remove_all(lst: list, items_to_remove: set) -> list:
 def check_stop(
     request: Request, max_model_len: int, pooler_output: torch.Tensor | None = None
 ) -> bool:
+    # `num_output_tokens_total`, not `num_output_tokens`: a request preempted by
+    # a DP<->TP switch has its generated tokens folded into its prompt, which
+    # zeroes `num_output_tokens`. Counting only the physical list would restart
+    # the budget at the switch and let the request emit up to `max_tokens` more.
     if (
         request.num_tokens >= max_model_len
-        or request.num_output_tokens >= request.max_tokens
+        or request.num_output_tokens_total >= request.max_tokens
     ):
         request.status = RequestStatus.FINISHED_LENGTH_CAPPED
         return True
@@ -58,7 +62,7 @@ def check_stop(
     sampling_params = request.sampling_params
     assert sampling_params is not None
 
-    if request.num_output_tokens < sampling_params.min_tokens:
+    if request.num_output_tokens_total < sampling_params.min_tokens:
         return False
 
     last_token_id = request.output_token_ids[-1]

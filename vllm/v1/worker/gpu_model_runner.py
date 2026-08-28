@@ -508,6 +508,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         )
         
         self.dtp_context_switch_status = False
+        # The merge set whose KV layout is currently applied -- distinct
+        # from `long_request_engine_ids`, which the worker overwrites with
+        # the *requested* set at the transition.
+        self.dtp_applied_ids: tuple[int, ...] = ()
         self.original_status = {}
         self.long_request_engine_ids = [0, 1]
 
@@ -2429,72 +2433,121 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             **model_kwargs,
         )
 
+    # ------------------------------------------------------------------ #
+    #  Dynamic DP<->TP: the merged KV layout
+    # ------------------------------------------------------------------ #
+    def dtp_apply_layout(self, long_request_engine_ids) -> None:
+        """Reinterpret this rank's KV cache for a merged TP group of `ids`.
+
+        A merged rank owns 1/dtp_size of the heads, so the same bytes hold
+        dtp_size times as many token slots:
+
+            [2, blocks, block_size, kv_heads, head_dim]
+         -> [2, blocks, block_size * d, kv_heads / d, head_dim]
+
+        The cache spec, the attention metadata builder and the block table all
+        have to agree on that reinterpretation. If any one of them is left at a
+        different width, the slot a token is *written* to stops being the slot
+        it is *read* from, and attention silently returns whatever happens to
+        live at the address it reads.
+        """
+        ids = tuple(sorted(long_request_engine_ids))
+        if self.dtp_applied_ids and self.dtp_applied_ids != ids:
+            # A previous episode's layout is still applied. Scaling on top of it
+            # would compound the two widths; the new one has to be applied to
+            # the unmerged layout.
+            self.dtp_undo_layout()
+        dtp_size = len(ids)
+        self.dtp_context_switch_status = True
+        self.long_request_engine_ids = ids
+        self.model.model.long_request_engine_ids = ids
+        self.original_status["dtp_size"] = dtp_size
+        if self.dtp_applied_ids == ids:
+            return
+
+        saved = []
+        for group_id, group_spec in enumerate(
+                self.kv_cache_config.kv_cache_groups):
+            spec = group_spec.kv_cache_spec
+            block_table = self.input_batch.block_table.block_tables[group_id]
+            builder = self._dtp_metadata_builder(group_id)
+            saved.append((
+                spec.block_size,
+                spec.num_kv_heads,
+                block_table.block_size,
+                None if builder is None else (builder.block_size,
+                                              builder.num_heads_kv,
+                                              builder.num_heads_q),
+            ))
+            group_spec.kv_cache_spec = replace(
+                spec,
+                block_size=spec.block_size * dtp_size,
+                num_kv_heads=spec.num_kv_heads // dtp_size)
+            block_table.block_size *= dtp_size
+            if builder is not None:
+                builder.block_size *= dtp_size
+                builder.num_heads_kv //= dtp_size
+                # FlashAttention 3 derives its ahead-of-time tile schedule from
+                # the query head count too; leaving it unmerged hands the kernel
+                # a schedule for dtp_size times the heads that exist.
+                builder.num_heads_q //= dtp_size
+
+        self.original_status["kv_layout"] = saved
+        self.dtp_applied_ids = ids
+        self.kv_cache_config.change_status_for_dtp = True
+
+    def dtp_undo_layout(self) -> None:
+        """Restore the unmerged KV layout. Idempotent.
+
+        Restores saved absolute values instead of dividing the merged ones back
+        out: by the time this runs, `long_request_engine_ids` may already carry
+        the *next* merge set (`worker_set_dtp_group_state` pushes it at the
+        transition), and undoing a width-2 layout by four leaves it wrong with
+        no error anywhere.
+        """
+        self.dtp_context_switch_status = False
+        saved = self.original_status.get("kv_layout")
+        if saved is not None:
+            for group_id, group_spec in enumerate(
+                    self.kv_cache_config.kv_cache_groups):
+                block_size, num_kv_heads, bt_block, builder_state = saved[
+                    group_id]
+                group_spec.kv_cache_spec = replace(group_spec.kv_cache_spec,
+                                                   block_size=block_size,
+                                                   num_kv_heads=num_kv_heads)
+                self.input_batch.block_table.block_tables[
+                    group_id].block_size = bt_block
+                builder = self._dtp_metadata_builder(group_id)
+                if builder is not None and builder_state is not None:
+                    (builder.block_size, builder.num_heads_kv,
+                     builder.num_heads_q) = builder_state
+        self.dtp_applied_ids = ()
+        self.original_status = {}
+        self.kv_cache_config.change_status_for_dtp = False
+
+    def _dtp_metadata_builder(self, group_id: int):
+        if group_id < len(self.attn_groups) and self.attn_groups[group_id]:
+            return self.attn_groups[group_id][0].get_metadata_builder()
+        return None
+
     @contextmanager
     def dtp_context(self, long_request_engine_ids: list[int]):
+        """Keep the merged layout in step with the process-wide DTP state.
+
+        The authoritative transitions happen in `worker_set_dtp_group_state`,
+        which runs on every engine of the group whether or not it has work this
+        step. This is the safety net for both directions.
+        """
         if not get_dtp_group_state():
-            if self.dtp_context_switch_status:
-                self.dtp_context_switch_status = False
-                dtp_size = len(self.long_request_engine_ids)
-                if self.kv_cache_config.change_status_for_dtp:
-                    for kv_cache_group_id, kv_cache_group_spec in enumerate(
-                        self.kv_cache_config.kv_cache_groups):
-                            current_spec = kv_cache_group_spec.kv_cache_spec
-                            new_spec = replace(current_spec,
-                                            block_size=current_spec.block_size // dtp_size,
-                                            num_kv_heads=current_spec.num_kv_heads * dtp_size)
-                            kv_cache_group_spec.kv_cache_spec = new_spec
-                            # Get metadata builder from attn_groups instead of attn_metadata_builders
-                            if kv_cache_group_id < len(self.attn_groups) and self.attn_groups[kv_cache_group_id]:
-                                attn_group = self.attn_groups[kv_cache_group_id][0]  # Use first attention group
-                                builder = attn_group.get_metadata_builder()
-                                builder.block_size //= dtp_size
-                                builder.num_heads_kv *= dtp_size
-                                
-                            self.input_batch.block_table.block_tables[kv_cache_group_id].block_size //= dtp_size
-                    self.kv_cache_config.change_status_for_dtp = False
-                
-                self.original_status = {}
-                self.long_request_engine_ids = [0, 1]
+            if self.dtp_context_switch_status or self.dtp_applied_ids:
+                self.dtp_undo_layout()
             yield
             return
-        
-        if self.dtp_context_switch_status:
-            yield
-            return
-        
-        self.dtp_context_switch_status = True
-        self.long_request_engine_ids = tuple(sorted(long_request_engine_ids))
-        self.model.model.long_request_engine_ids = self.long_request_engine_ids
-        # self.original_status = {}
-        # self.original_status["original_block_size"] = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
-        # self.original_status["original_num_kv_heads"] = self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.num_kv_heads
-        # if we are running in DTP group, we need to change the block size
-        # original:[2, block_num, block_size, kv_head_num, kv_head_size]
-        # new:[2, block_num, block_size*dtp_size, kv_head_num/dtp_size, kv_head_size]
-        dtp_size = len(self.long_request_engine_ids)
-        self.original_status["dtp_size"] = dtp_size
-        
-        if not self.kv_cache_config.change_status_for_dtp:
-            for kv_cache_group_id, kv_cache_group_spec in enumerate(
-                    self.kv_cache_config.kv_cache_groups):
-                    current_spec = kv_cache_group_spec.kv_cache_spec
-                    new_spec = replace(current_spec,
-                                    block_size=current_spec.block_size * dtp_size,
-                                    num_kv_heads=current_spec.num_kv_heads // dtp_size)
-                    kv_cache_group_spec.kv_cache_spec = new_spec
-                    # Get metadata builder from attn_groups instead of attn_metadata_builders
-                    if kv_cache_group_id < len(self.attn_groups) and self.attn_groups[kv_cache_group_id]:
-                        attn_group = self.attn_groups[kv_cache_group_id][0]  # Use first attention group
-                        builder = attn_group.get_metadata_builder()
-                        builder.block_size *= dtp_size
-                        builder.num_heads_kv //= dtp_size
-                    self.input_batch.block_table.block_tables[kv_cache_group_id].block_size *= dtp_size
-            self.kv_cache_config.change_status_for_dtp = True
-        
-        try:
-            yield
-        finally:
-            pass
+
+        self.dtp_apply_layout(long_request_engine_ids
+                              or self.long_request_engine_ids)
+
+        yield
 
     @torch.inference_mode()
     def execute_model(

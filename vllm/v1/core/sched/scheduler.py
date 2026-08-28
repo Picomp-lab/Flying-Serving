@@ -40,12 +40,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-from vllm.distributed.parallel_state import (set_dtp_group_state, 
-                                             set_dtp_group_request, 
-                                             get_dtp_group_request, 
-                                             get_dtp_group_world_size)
 
-from vllm.config import ParallelConfig
 
 from dataclasses import replace
 
@@ -191,28 +186,45 @@ class Scheduler(SchedulerInterface):
         
         self.want_to_execute_long_request: bool = False
         self.last_request_before_switch: set[str] = set()
-        self.pre_executing_TP_requests: bool = False
-        self.last_request_need_to_switch: Optional[str] = None
-        
-        # parallel dp group are running now. default is self.dp_rank.
-        self.running_parallel_engines: Optional[list[int]] = [self.parallel_config.data_parallel_rank]
-        
+
         self.dp_rank: Optional[int] = None
         
         # switch mode: 
         # preempt: schedule the long request immediately and preempt the running requests.
         # sequential: schedule the long request after all the requests before the switch are finished.
         self.switch_mode: str = 'sequential' # 'sequential'
-        self.track_last_request_need_to_switch: bool = False
         self.set_kv_cache_config_already: bool = False
         
         self.cached_TP_requests_order = create_request_queue(self.policy)
-        self.skipped_TP_requests: list[Request] = []
         self.pre_executed_TP_requests: dict[str, Request] = {}
         self.TP_wave_counter: int = 0
-        self.dynamic_requests: list[Request] = []
         self.TP_execute_number: int = 10000000
         self.waiting_switch_success_flag: Optional[str] = None
+
+        # Leaving TP mode is a collective decision, mirroring the way entering it
+        # is agreed in `_has_global_unfinished_reqs_simple`. This engine sets
+        # `want_to_exit_long_request` when it sees the switch request;
+        # `exit_long_request_now` is set by the admission barrier only once every
+        # merged engine has, so the flip lands on the same step everywhere.
+        self.want_to_exit_long_request: bool = False
+        self.exit_long_request_now: bool = False
+        self._exit_switch_request: Optional[Request] = None
+
+    def _dtp_skip_cache(self, request: Request) -> bool:
+        """Whether `request` must be prefilled from scratch to stay in lockstep.
+
+        True only for requests that the merged engines prefill *together* (TP
+        requests, while in TP mode). Their per-request token counts have to be
+        identical on every merged engine, and a cache lookup is engine-local, so
+        it is the one input to `num_new_tokens` that can differ. Requests running
+        in DP mode are executed by a single engine and keep normal prefix
+        caching.
+        """
+        return (
+            self.long_request_execution_mode
+            and request.long_request_engines is not None
+            and len(request.long_request_engines) > 1
+        )
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -236,6 +248,12 @@ class Scheduler(SchedulerInterface):
         set_dtp_group_status = False
         reset_dtp_group_status = False
         
+        if self.long_request_execution_mode and self.exit_long_request_now:
+            # Agreed by the barrier's all-reduce, so every merged engine runs
+            # this on the same step. Do it before the scheduling loops: it clears
+            # `self.running`, and anything scheduled first would be thrown away.
+            reset_dtp_group_status = self._exit_long_request_mode()
+
         if self.long_request_execution_mode:
             set_dtp_group_status = self._schedule_long_request_exclusive()
 
@@ -420,53 +438,27 @@ class Scheduler(SchedulerInterface):
                             self.waiting_switch_success_flag = 'DP'
                             # 如果切换方式为直接抢占，那么我们就需要将正在以TP模式运行的请求抢占，然后切换为DP模式
                             if request.switch_method == 'hard-preempt':
-                                # self.running.extend(scheduled_new_reqs)
-                                logger.info(f"---------------dp rank {self.dp_rank} switch TP -> DP------------------")
+                                # Vote to leave and carry on. The switch itself
+                                # happens in `_exit_long_request_mode`, once the
+                                # barrier reports every engine has voted.
+                                #
+                                # Deliberately *not* stopping here: this step's
+                                # admission cap was agreed before `schedule()`
+                                # ran, and an engine that unilaterally stopped
+                                # admitting would build a smaller batch than the
+                                # engines that have not seen the switch request
+                                # yet. The barrier drops the cap to 0 everywhere
+                                # from the next step instead.
+                                self.want_to_exit_long_request = True
+                                self._exit_switch_request = request
+                                # Set aside for this step, not removed: it stays
+                                # in the waiting queue (restored at the end of
+                                # the loop) so `has_unfinished_requests()` keeps
+                                # counting it while the vote converges. An engine
+                                # that looked idle here would let the busy loop
+                                # declare the wave complete mid-switch.
                                 self.waiting.pop_request()
-                                self.running.append(request)
-                                preempted = create_request_queue(self.policy)
-                                for i, req in enumerate(self.running):
-                                    # 我们将这些request都转换成DP模式，每个request都分配一个DP rank
-                                    new_engine_ids = self.long_request_engines[i%len(self.long_request_engines)]
-                                    # logger.info(f"dp rank {self.dp_rank} preempting request: {req.request_id} to engine: {new_engine_ids}")
-                                    if self.dp_rank != new_engine_ids:
-                                        continue
-                                    req.long_request_engines = [new_engine_ids]
-                                    req.output_engine = new_engine_ids
-                                    # 将其从现在的running中抢占
-                                    # scheduled_running_reqs.remove(req)
-                                    # token_budget += num_scheduled_tokens[req.request_id]
-                                    # req_to_new_blocks.pop(req.request_id)
-                                    # num_scheduled_tokens.pop(req.request_id)
-                                    req.reset_output_token_ids(req._output_token_ids)
-                                    self.kv_cache_manager.free(req)
-                                    req.status = RequestStatus.WAITING
-                                    req.num_computed_tokens = 0
-                                    req.num_preemptions += 1
-                                    if self.log_stats:
-                                        req.record_event(EngineCoreEventType.PREEMPTED, time.monotonic())
-                                    preempted.add_request(req)
-                                    
-                                
-                                self.kv_cache_config_reset()
-
-                                scheduled_new_reqs = []
-                                scheduled_running_reqs = []   
-                                num_scheduled_tokens = {}
-                                num_new_tokens = 0                                 
-                                self.waiting.prepend_requests(preempted)
-                                request.switch_running_mode_flag = False
-                                self.running = []
-                                self.long_request_execution_mode = False
-                                self.pending_long_request_sync_id = None
-                                self.want_to_execute_long_request = False
-                                reset_dtp_group_status = True
-                                # self.long_request_engines = [self.dp_rank]
-                                self.running_parallel_engines = [self.dp_rank]
-                                self.waiting_switch_success_flag = None
-                                self.TP_execute_number = 10000000
-                                token_budget = self.max_num_scheduled_tokens
-                                
+                                skipped_waiting_requests.add_request(request)
                                 continue
                             # 如果切换方式为顺序执行，那么我们就需要确定这些正在执行的request都执行完了才切换，
                             # 那么我们需要设置一个状态记录我们正处于切换状态，保证在切换成功之前，忽略其他切换的请求。
@@ -474,22 +466,17 @@ class Scheduler(SchedulerInterface):
                             # TODO: 还没有完成
                             elif request.switch_method == 'sequential':
                                 self.switch_mode = 'sequential'
-                                self.pre_executing_TP_requests = False
                                 if len(self.running) > 0:
                                     self.last_request_before_switch = self.running[-1].request_id
                                 if len(scheduled_new_reqs) > 0:
                                     self.last_request_before_switch = scheduled_new_reqs[-1].request_id
                                     logger.info(f"************** rare case **************")
-                                if not self.last_request_before_switch:
-                                    self.pre_executing_TP_requests = True
-                                    
                                 continue
                             else:
                                 raise ValueError(f"Invalid switch method: {request.switch_method}")
                         else:
                             logger.info(f"************** rare case **************Invalid switch mode: {request.switch_mode}")
                             break
-                            raise ValueError(f"Invalid switch mode: {request.switch_mode}")
                     # 如果来的是正常的request
                     else:
                         # Skip only if the request is explicitly routed to other
@@ -504,21 +491,21 @@ class Scheduler(SchedulerInterface):
                             continue
                         # 这时如果没有新的TP request来了，那么我们可以让其先执行后面DP request
                         if request.long_request_engines != self.long_request_engines:
-                            # 我们只考虑单DP engine的情况
-                            break
-                            logger.info(f"*************************************")
-                            if set(request.long_request_engines).issubset(self.long_request_engines):
-                                # 这里我们需要切换engine id，确保worker正常执行，
-                                # 同时我们还需要记录下这些切换的request id，在后面执行结束的时候，需要切换回来。
-                                request.old_long_request_engines = request.long_request_engines
-                                request.long_request_engines = self.long_request_engines
-                                self.dynamic_requests.append(request)
-                                # 这里不能continue，我们需要让下面的代码正常schedule这个request。
-                            else:
-                                raise NotImplementedError("Multiple DP engines are not implemented yet")
-                                self.waiting.pop_request()
-                                skipped_waiting_requests.add_request(request)
-                                continue
+                            # A request routed to a different engine set than the
+                            # one currently merged -- typically a DP request that
+                            # a hard-preempt DP->TP switch pushed back into the
+                            # waiting queue. It cannot run while merged (only
+                            # this engine holds it, so the merged engines would
+                            # build different batches), but it must not block the
+                            # queue head either: set it aside for this step and
+                            # let it resume when the engines split back to DP.
+                            # This used to `break`, which stalls every TP request
+                            # queued behind it -- on this engine only, so the
+                            # merged engines diverge and the next collective
+                            # deadlocks.
+                            self.waiting.pop_request()
+                            skipped_waiting_requests.add_request(request)
+                            continue
                 # 如果正在执行DP模式
                 else:
                     # 如果请求切换状态的request来了
@@ -532,12 +519,48 @@ class Scheduler(SchedulerInterface):
                             self.TP_wave_counter = 0
                             
                             if request.switch_method == 'hard-preempt':
-                                # 这里我们不能直接抢占，因为DP模式不是同步的，我们不知道每个DP是否都执行完了前面的DP request。
-                                raise NotImplementedError("Hard preempt method is not implemented yet")
-                                self.want_to_execute_long_request = True
-                                request = self.waiting.peek_request()
+                                # Drop everything this engine is running in DP
+                                # mode right now instead of waiting for it to
+                                # drain, then declare readiness to switch.
+                                #
+                                # The original objection here was that DP mode is
+                                # not synchronous, so an engine cannot know that
+                                # the others have finished their earlier DP
+                                # requests. It does not need to: the engines
+                                # still only flip `long_request_execution_mode`
+                                # together, in the DP-wide all-reduce in
+                                # `_has_global_unfinished_reqs_simple`, which
+                                # takes the *min* of `want_to_execute_long_request`
+                                # and additionally requires every engine to name
+                                # the same pending switch id. An engine that has
+                                # not preempted yet simply reports False and the
+                                # switch waits for the next sync round. What
+                                # hard-preempt removes is the drain wait, not the
+                                # barrier.
+                                logger.info(
+                                    "---------------dp rank %s DP --> TP "
+                                    "(hard-preempt)------------------",
+                                    self.dp_rank)
+                                self.switch_method = 'hard-preempt'
                                 self.pending_long_request_sync_id = request.request_id
-                                # 这里我们不再schedule其他的request
+                                self.long_request_engines = request.long_request_engines
+                                self.last_request_before_switch.clear()
+                                self._hard_preempt_dp_requests(scheduled_new_reqs)
+                                # Everything scheduled earlier in this same
+                                # `schedule()` call was just preempted, so drop
+                                # the partially built batch with it.
+                                scheduled_new_reqs = []
+                                scheduled_running_reqs = []
+                                scheduled_resumed_reqs = []
+                                num_scheduled_tokens = {}
+                                req_to_new_blocks = {}
+                                scheduled_spec_decode_tokens = {}
+                                scheduled_encoder_inputs = {}
+                                token_budget = self.max_num_scheduled_tokens
+                                self.want_to_execute_long_request = True
+                                request.switch_running_mode_flag = False
+                                # Admit nothing else this step; `_dp_switch_pending`
+                                # keeps this engine idle until TP mode is on.
                                 break
                             elif request.switch_method == 'sequential':
                                 self.pending_long_request_sync_id = request.request_id
@@ -567,6 +590,15 @@ class Scheduler(SchedulerInterface):
                     
                     # 如果来的是正常的request
                     else:
+                        # A hard-preempt DP->TP switch is pending on this engine:
+                        # it has already thrown away its DP work and is only
+                        # waiting for the other engines to do the same. Admitting
+                        # anything now just creates work for the switch to
+                        # preempt again, so sit idle (the busy loop issues dummy
+                        # batches) until the DP-wide sync turns TP mode on and
+                        # clears `waiting_switch_success_flag`.
+                        if self._dp_switch_pending():
+                            break
                         # Skip only if the request is explicitly routed to other
                         # DP engines. An empty `long_request_engines` means the
                         # request carries no DTP routing (e.g. single-engine /
@@ -637,7 +669,23 @@ class Scheduler(SchedulerInterface):
                 load_kv_async = False
 
                 # Get already-cached tokens.
-                if request.num_computed_tokens == 0:
+                if request.num_computed_tokens == 0 and self._dtp_skip_cache(request):
+                    # DTP: a TP request is prefilled jointly by all the merged
+                    # engines, so they must schedule the *same* number of tokens
+                    # for it. Cache lookups break that: each engine keeps its own
+                    # prefix cache (populated by whatever it happened to serve
+                    # while in DP mode) and in TP mode the KV is re-blocked
+                    # (block_size //= dtp_size), so the same request can hit on
+                    # one engine and miss on another. The engines then build
+                    # differently shaped batches and the merged-TP forward hangs
+                    # on mismatched all-reduces. The admission barrier equalizes
+                    # *which* requests are admitted, not how many tokens each one
+                    # gets, so the only cheap way to keep the batches identical is
+                    # to give TP requests no cached prefix at all.
+                    new_computed_blocks = self.kv_cache_manager.empty_kv_cache_blocks
+                    num_new_local_computed_tokens = 0
+                    num_computed_tokens = 0
+                elif request.num_computed_tokens == 0:
                     # Get locally-cached tokens.
                     new_computed_blocks, num_new_local_computed_tokens = (
                         self.kv_cache_manager.get_computed_blocks(request)
@@ -931,9 +979,22 @@ class Scheduler(SchedulerInterface):
         self.block_size *= dtp_size
         for i, manager in enumerate(self.kv_cache_manager.coordinator.single_type_managers):
             manager.block_size *= dtp_size
+        logger.info(
+            "[DTP] dp%s kv set: engines=%s dtp=%s block_size=%s spec_block=%s "
+            "spec_kv_heads=%s", self.dp_rank, self.long_request_engines, dtp_size,
+            self.block_size,
+            self.kv_cache_manager.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size,
+            self.kv_cache_manager.kv_cache_config.kv_cache_groups[0].kv_cache_spec.num_kv_heads)
     
     def kv_cache_config_reset(self,):
         dtp_size = len(self.long_request_engines)
+        # Paired with `kv_cache_config_set`, which multiplies by the same
+        # factor. An unpaired reset silently shrinks the block size for the rest
+        # of the process; fail here, at the unpaired call, rather than several
+        # switches later inside `cdiv(num_tokens, block_size)`.
+        assert self.block_size > 0 and self.block_size % dtp_size == 0, (
+            f"kv_cache_config_reset would corrupt block_size "
+            f"({self.block_size} // {dtp_size}); set/reset are unpaired")
         current_spec = self.kv_cache_manager.kv_cache_config.kv_cache_groups[0].kv_cache_spec
         new_spec = replace(current_spec, 
                            block_size=current_spec.block_size // dtp_size,
@@ -943,6 +1004,12 @@ class Scheduler(SchedulerInterface):
         self.block_size //= dtp_size
         for _, manager in enumerate(self.kv_cache_manager.coordinator.single_type_managers):
             manager.block_size //= dtp_size
+        logger.info(
+            "[DTP] dp%s kv reset: engines=%s dtp=%s block_size=%s spec_block=%s "
+            "spec_kv_heads=%s", self.dp_rank, self.long_request_engines, dtp_size,
+            self.block_size,
+            self.kv_cache_manager.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size,
+            self.kv_cache_manager.kv_cache_config.kv_cache_groups[0].kv_cache_spec.num_kv_heads)
     
     def _schedule_long_request_exclusive(self) -> bool:
         """Schedule only the long request, preempting all other running requests."""
@@ -951,55 +1018,27 @@ class Scheduler(SchedulerInterface):
             set_dtp_group_status = True
             self.switch_dtp_group_state_already = True
         
-        # if self.running and self.running[0].long_request_engines != self.long_request_engines:
-        #     # enter here means all dp engines are ready to execute the long request and the first
-        #     # time to schedule the first long request. We need to preempt all the running requests.
-        #     # TODO: optimize: maybe we has to let these requests finish first and then preempt them.
-        #     for req in self.running:
-        #         self.kv_cache_manager.free(req)
-        #         req.status = RequestStatus.PREEMPTED
-        #         req.num_computed_tokens = 0
-        #         req.num_preemptions += 1
-        #         if self.log_stats:
-        #             req.record_event(EngineCoreEventType.PREEMPTED, time.monotonic())
-        #         self.waiting.prepend_request(req)
-                
-        #     self.running.clear()
-            
         # Set kv cache config
         if not self.set_kv_cache_config_already:
             logger.info(f"---------------dp rank {self.dp_rank} DP --> TP------------------")
             self.kv_cache_config_set()
             self.set_kv_cache_config_already = True
+            # Requests a hard-preempt switch pushed back into the queue that
+            # this engine alone holds. A merged group can only run requests
+            # every engine has, so these are *deferred*, not cancelled: they
+            # resume on the next TP->DP switch. If the workload never switches
+            # back they sit here indefinitely, so make that visible rather than
+            # letting it look like a hang.
+            deferred = [r.request_id for r in self.waiting
+                        if r.long_request_engines != self.long_request_engines]
+            if deferred:
+                logger.warning(
+                    "dp rank %s entering TP mode with %d deferred DP request(s) "
+                    "%s -- they cannot run while merged and resume only when the "
+                    "engines split back to DP",
+                    self.dp_rank, len(deferred), deferred)
           
         return set_dtp_group_status
-    
-    def _create_empty_scheduler_output(self) -> SchedulerOutput:
-        """Create an empty scheduler output."""
-        return SchedulerOutput(
-            scheduled_new_reqs=[],
-            scheduled_cached_reqs=CachedRequestData(
-                req_ids=[],
-                resumed_from_preemption=[],
-                new_token_ids=[],
-                new_block_ids=[],
-                num_computed_tokens=[],
-                num_output_tokens=[],
-                resumed_req_token_ids=[],
-            ),
-            num_scheduled_tokens={},
-            total_num_scheduled_tokens=0,
-            scheduled_spec_decode_tokens={},
-            scheduled_encoder_inputs={},
-            num_common_prefix_blocks=[0] * len(self.kv_cache_config.kv_cache_groups),
-            finished_req_ids=self.finished_req_ids,
-            free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
-            structured_output_request_ids={},
-            grammar_bitmask=None,
-            pending_long_request_sync_id=None,
-            switch_dtp_group_state=False,
-            long_request_engine_ids=None,
-        )
     
     def _merge_pre_executed_TP_requests(
         self, 
@@ -1051,18 +1090,127 @@ class Scheduler(SchedulerInterface):
         for request in self.waiting:
             logger.info(f"dp rank {self.dp_rank} waiting TP request: {request.request_id} with status: {request.status}")
                     
-    def _preempt_TP_requests(self, scheduled_new_reqs: list[Request]) -> None:
-        self.running.extend(scheduled_new_reqs)
-        for i, request in enumerate(self.running):
-            self.kv_cache_manager.free(request)
-            request.status = RequestStatus.WAITING
-            request.num_computed_tokens = 0
-            request.num_preemptions += 1
-            new_engine_ids = request.long_request_engines[i%len(request.long_request_engines)]
-            request.long_request_engines = [new_engine_ids]
-            request.output_engine = new_engine_ids
-            request.reset_output_token_ids(request._output_token_ids)
-            self.waiting.prepend_request(request)
+    def _exit_long_request_mode(self) -> bool:
+        """Split the merged engines back into DP replicas.
+
+        Only ever called when the admission barrier's all-reduce reported that
+        *every* merged engine voted to leave, so all of them run this on the same
+        step. Leaving TP mode used to be decided locally, the moment the switch
+        request reached an engine's queue head; if it arrived a step apart, one
+        engine ran in DP mode while the other was still merged and the next
+        collective hung both of them.
+
+        Each still-running request is handed to one DP engine round-robin. Only
+        the engine that gets it keeps it — the others hold an identical copy and
+        drop theirs. Returns True so `schedule()` tells the workers to tear the
+        `_DTP` group down.
+        """
+        request = self._exit_switch_request
+        assert request is not None, (
+            "exit agreed without a switch request; the vote and the request that "
+            "caused it must be set together")
+        logger.info("---------------dp rank %s switch TP -> DP------------------",
+                    self.dp_rank)
+        self.waiting.remove_requests([request])
+        self.running.append(request)
+        preempted = create_request_queue(self.policy)
+        for i, req in enumerate(self.running):
+            # 我们将这些request都转换成DP模式，每个request都分配一个DP rank
+            new_engine_ids = self.long_request_engines[i % len(self.long_request_engines)]
+            if self.dp_rank != new_engine_ids:
+                # Handed to another engine, which holds its own copy. Drop ours
+                # -- but free the blocks first: `self.running = []` below loses
+                # the only reference to them, and `kv_cache_config_reset()` right
+                # after changes the block size, so anything still allocated is
+                # mis-accounted for the rest of the run. Over repeated switches
+                # this leaks the pool dry.
+                self.kv_cache_manager.free(req)
+                continue
+            req.long_request_engines = [new_engine_ids]
+            req.reset_output_token_ids(req._output_token_ids)
+            self.kv_cache_manager.free(req)
+            req.status = RequestStatus.WAITING
+            req.num_computed_tokens = 0
+            req.num_preemptions += 1
+            if self.log_stats:
+                req.record_event(EngineCoreEventType.PREEMPTED, time.monotonic())
+            preempted.add_request(req)
+
+        self.kv_cache_config_reset()
+        # `kv_cache_config_set` (DP->TP) multiplies the block size by the
+        # merged-engine count and this reset divides it back, so the two must run
+        # the same number of times. `set` is gated on
+        # `set_kv_cache_config_already`, and nothing used to clear that flag on
+        # the way out -- so `set` ran once for the whole process while `reset`
+        # ran on every TP->DP switch. block_size then halved per cycle
+        # (16, 8, 4, 2, 1) until the fifth switch divided by zero in
+        # `cdiv(num_tokens, block_size)`. Clear it here, where the reset happens.
+        self.set_kv_cache_config_already = False
+
+        self.waiting.prepend_requests(preempted)
+        request.switch_running_mode_flag = False
+        self.running = []
+        self.long_request_execution_mode = False
+        self.pending_long_request_sync_id = None
+        self.want_to_execute_long_request = False
+        self.waiting_switch_success_flag = None
+        self.TP_execute_number = 10000000
+        self.want_to_exit_long_request = False
+        self.exit_long_request_now = False
+        self._exit_switch_request = None
+        return True
+
+    def _dp_switch_pending(self) -> bool:
+        """True while this engine has hard-preempted for a DP->TP switch.
+
+        Set the moment the switch request is seen and cleared by the DP-wide
+        sync that turns TP mode on (`waiting_switch_success_flag = None` in
+        `_has_global_unfinished_reqs_simple`). Purely local state -- it gates
+        *local* admission only and never a collective, so engines may disagree
+        about it without diverging.
+        """
+        return (self.waiting_switch_success_flag == 'TP'
+                and self.switch_method == 'hard-preempt'
+                and not self.long_request_execution_mode)
+
+    def _hard_preempt_dp_requests(
+        self,
+        scheduled_new_reqs: list[Request],
+    ) -> None:
+        """Preempt everything this engine is running, for a DP->TP switch.
+
+        Every block is freed, not just the blocks of some requests: TP mode
+        rewrites the KV block size (`kv_cache_config_set` multiplies it by the
+        merged-engine count), so a block still held under the old size would be
+        mis-accounted for the rest of the episode.
+
+        Generated tokens are folded into each request's prompt rather than
+        discarded, so a preempted request resumes by re-prefilling its own
+        output instead of starting over and emitting it twice. The folded
+        tokens keep counting against `max_tokens`; see
+        `Request.reset_output_token_ids`.
+        """
+        preempted = create_request_queue(self.policy)
+        seen: set[str] = set()
+        # `scheduled_new_reqs` is already appended to `self.running` by the
+        # waiting loop, but chain it anyway so this stays correct if that
+        # changes; dedupe on request id.
+        for req in itertools.chain(self.running, scheduled_new_reqs):
+            if req.request_id in seen:
+                continue
+            seen.add(req.request_id)
+            self.kv_cache_manager.free(req)
+            req.reset_output_token_ids(req._output_token_ids)
+            req.status = RequestStatus.WAITING
+            req.num_computed_tokens = 0
+            req.num_preemptions += 1
+            if self.log_stats:
+                req.record_event(EngineCoreEventType.PREEMPTED, time.monotonic())
+            preempted.add_request(req)
+        logger.info("dp rank %s hard-preempted %d DP requests for DP->TP",
+                    self.dp_rank, len(seen))
+        self.running = []
+        self.waiting.prepend_requests(preempted)
 
     def _update_after_schedule(
         self,
@@ -1498,19 +1646,6 @@ class Scheduler(SchedulerInterface):
             if self.switch_method == 'sequential':
                 self.want_to_execute_long_request = True
                 # self.waiting_switch_success_flag = None
-
-        # # Shouwei's note: If the long request is finished, reset the state
-        # if self.last_request_need_to_switch in self.finished_req_ids:
-            
-        #     self.pending_long_request_sync_id = None
-        #     self.last_request_need_to_switch = None
-        #     self.running_parallel_engines = [self.parallel_config.data_parallel_rank]
-        #     self.want_to_execute_long_request = False
-        #     self.switch_dtp_group_state_already = False
-        #     self.long_request_execution_mode = False
-        #     self.long_request_engines = None
-        #     #TODO: assuming using one client maybe not enough
-        #     engine_core_outputs[0].switch_dtp_group_state = True
 
         return engine_core_outputs
 

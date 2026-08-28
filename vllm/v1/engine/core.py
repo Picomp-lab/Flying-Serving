@@ -15,6 +15,7 @@ from logging import DEBUG
 from typing import Any, TypeVar
 
 import msgspec
+import torch
 import zmq
 
 from vllm.config import ParallelConfig, VllmConfig
@@ -66,16 +67,50 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.version import __version__ as VLLM_VERSION
 
-from vllm.distributed.parallel_state import (get_dtp_group_request, 
-                                            get_dtp_group_state, 
-                                            get_dtp_group, 
-                                            set_dtp_group_request,
-                                            get_dtp_group_world_size)
-import torch
-import torch.distributed as dist
-from dataclasses import replace
 
 logger = init_logger(__name__)
+
+# Per-request DP<->TP tracing. Off by default: it logs one line per request per
+# engine, which is far too much for a real run but is the only way to tell a
+# switch request that never arrived from one that arrived and was not acted on.
+DTP_DEBUG = os.environ.get("VLLM_DTP_DEBUG", "0") == "1"
+
+
+def dtp_switch_agreed(tensor: torch.Tensor, dp_rank: int, dp_size: int) -> bool:
+    """Whether this engine may enter TP mode on this step.
+
+    `tensor` is the `[dp_size, 3 + dp_size]` result of
+    `ParallelConfig.has_unfinished_dp_and_switch_mode`, MAX-all-reduced over the
+    DP group, so every engine holds the same matrix. Row `e` is engine `e`:
+    column 1 is its vote to switch, column 2 identifies the switch request it
+    saw, and columns `3:3+dp_size` are the engine set it proposes to merge with,
+    as a bitmask.
+
+    This engine enters TP mode iff every member of the set it proposes votes to
+    switch, names the *same* switch request, and proposes the *same* set. Since
+    the matrix is identical everywhere, all members of a group reach this verdict
+    on the same step -- and engines outside the group are untouched, which is
+    what lets one group merge while the rest of the deployment keeps serving DP
+    traffic (or merges into a group of its own).
+
+    The old rule was `tensor[:, 1].min()` and `tensor[:, 2] == tensor[0, 2]`,
+    i.e. agreement across *all* engines. That is the same thing when the whole
+    deployment merges at once, and unsatisfiable for any narrower merge: one
+    engine still in DP mode votes 0 and pins the min at 0 forever.
+    """
+    my_mask = tensor[dp_rank, 3:3 + dp_size]
+    group = [e for e in range(dp_size) if int(my_mask[e].item()) == 1]
+    if len(group) < 2 or dp_rank not in group:
+        return False
+    my_switch_id = int(tensor[dp_rank, 2].item())
+    for e in group:
+        if int(tensor[e, 1].item()) != 1:
+            return False
+        if int(tensor[e, 2].item()) != my_switch_id:
+            return False
+        if not torch.equal(tensor[e, 3:3 + dp_size], my_mask):
+            return False
+    return True
 
 
 def same(tensor_column):
@@ -223,21 +258,11 @@ class EngineCore:
         # so no barrier is needed and the engines stay in lockstep — at the cost
         # of up to N-1 steps (~(N-1)·TPOT) of new-request admission latency (TTFT).
         # Measured (8B, low load): N=1 TPOT 9.15ms/TTFT 28.8ms, N=2 8.46/33.0,
-        # N=4 8.31/41.7. N=2 halves the TPOT overhead and even recovers saturated
-        # throughput (5340→5469 tok/s) while keeping TTFT below static DP, so it
-        # is the default; set VLLM_DTP_SYNC_EVERY=1 for lowest TTFT.
-        self._dtp_sync_every = max(1, int(os.environ.get("VLLM_DTP_SYNC_EVERY", "2")))
-        # Experimental: overlap the admission barrier with the model forward by
-        # launching it async and consuming the (1-step-stale) result next step,
-        # so the per-step gloo round-trip is hidden behind execute_model. The
-        # stale cap is only an *upper* bound on admissions; see step() for why it
-        # stays correct (admit = min(cap, locally-available)). A/B vs the
-        # synchronous every-N barrier.
-        self._dtp_async_barrier = os.environ.get("VLLM_DTP_ASYNC_BARRIER", "0") == "1"
-        self._dtp_async_handle = None
-        self._dtp_async_tensor = None
-        self._dtp_stale_cap = 0
-        self._dtp_was_tp = False
+        # N=4 8.31/41.7. N=1 is the default: it is the only setting with no
+        # admission stall, and the TPOT it costs (~0.7ms) is the smaller half of
+        # the trade against the ~4ms of TTFT that N=2 adds. Raise it if TPOT
+        # matters more than TTFT for your workload.
+        self._dtp_sync_every = max(1, int(os.environ.get("VLLM_DTP_SYNC_EVERY", "1")))
         # Counter that advances only while in TP mode and resets outside it, so it
         # is identical across the merged engines (they enter/exit TP mode in
         # lockstep). NOT self.step_count, which diverges in DP mode.
@@ -324,6 +349,17 @@ class EngineCore:
                 "Disabling KVTransfer for this request."
             )
 
+        if DTP_DEBUG:
+            logger.info(
+                "[DTP-dbg] dp%s recv %s engines=%s switch=%s mode=%s "
+                "tp_mode=%s waiting=%d running=%d",
+                getattr(self, "dp_rank", None), request.request_id,
+                request.long_request_engines,
+                getattr(request, "switch_running_mode_flag", None),
+                getattr(request, "switch_mode", None),
+                self.scheduler.long_request_execution_mode,
+                len(self.scheduler.waiting), len(self.scheduler.running))
+
         self.scheduler.add_request(request)
 
     def abort_requests(self, request_ids: list[str]):
@@ -350,54 +386,115 @@ class EngineCore:
             )
             raise err
     
-    def kv_cache_config_reset(self, scheduler_output: SchedulerOutput):
-        dtp_size = len(scheduler_output.long_request_engine_ids)
-        current_spec = self.scheduler.kv_cache_manager.kv_cache_config.kv_cache_groups[0].kv_cache_spec
-        new_spec = replace(current_spec, 
-                           block_size=current_spec.block_size // dtp_size,
-                           num_kv_heads=current_spec.num_kv_heads * dtp_size)
-        self.scheduler.kv_cache_manager.kv_cache_config.kv_cache_groups[0].kv_cache_spec = new_spec
-        self.scheduler.kv_cache_manager.kv_cache_config.change_status_for_dtp = False
-        self.scheduler.block_size //= dtp_size
-        for _, manager in enumerate(self.scheduler.kv_cache_manager.coordinator.single_type_managers):
-            manager.block_size //= dtp_size
-
     def _count_waiting_tp(self) -> int:
+        """How many TP requests this engine could admit this step.
+
+        Has to mirror the scheduler's walk of the waiting queue exactly: the
+        min of this across engines becomes `TP_execute_number`, the cap on how
+        many the scheduler may admit, so if the two disagree the engines either
+        diverge or stop admitting.
+
+        Single-engine requests are *skipped*, not a stopping point. This used to
+        `break` on the first one, which matched a scheduler that also stopped
+        there -- but a hard-preempt DP->TP switch pushes the preempted DP
+        requests (single-engine by definition) to the head of the waiting queue.
+        Breaking there returns 0 on every engine, so the cap is 0, so nothing is
+        ever admitted and the switch wedges the engine permanently.
+
+        The scheduler admits a TP request only when its engine set is exactly
+        the set this engine is merged with (anything else is set aside), so the
+        count is over that same equality -- not over "multi-engine", which with
+        more than one mergeable subset also matches requests belonging to the
+        *other* merged group and would inflate this engine's cap.
+        """
+        merged_with = self.scheduler.long_request_engines
         c = 0
         for request in self.scheduler.waiting:
-            if len(request.long_request_engines) > 1:
+            if (request.long_request_engines
+                    and len(request.long_request_engines) > 1
+                    and request.long_request_engines == merged_with):
                 c += 1
-            else:
-                break
         return c
 
-    def _dtp_async_barrier_step(self) -> None:
-        """Admission barrier overlapped with the model forward (Option A).
+    def _dtp_barrier_group(self) -> tuple[Any, int, int]:
+        """`(process_group, size, rank_in_group)` for the merged engine set.
 
-        The gloo all-reduce of the per-engine waiting count is launched async and
-        its result consumed on the *next* step, so the round-trip hides behind
-        execute_model instead of stalling before schedule(). `TP_execute_number`
-        is only an upper bound — actual admissions are `min(cap, locally
-        available)` — so a (1-step-stale) cap never forces an engine to admit a
-        request it does not yet have. The first step of an episode seeds the cap
-        synchronously (one-time)."""
-        if self._dtp_async_handle is not None:
-            self._dtp_async_handle.wait()  # launched last step, overlapped its forward
-            self._dtp_stale_cap = int(self._dtp_async_tensor.min().item())
-            self._dtp_async_handle = None
-        elif not self._dtp_was_tp:
-            # Entering TP mode: no overlapped result yet — seed synchronously once.
-            self._dtp_stale_cap = ParallelConfig.sync_TP_requests_number(
-                self.dp_group, self.dp_size, self.dp_rank, self._count_waiting_tp())
-        self._dtp_was_tp = True
-        self.scheduler.TP_execute_number = self._dtp_stale_cap
+        Falls back to the DP-wide group when the merged set is the full
+        deployment and no subgroup was created for it (multi-node), which is the
+        pre-subset behaviour.
+        """
+        key = tuple(self.scheduler.long_request_engines or ())
+        pg = getattr(self, "dtp_subgroups", {}).get(key)
+        if pg is None:
+            return self.dp_group, self.dp_size, self.dp_rank
+        return pg, len(key), key.index(self.dp_rank)
 
-        # Launch the next barrier async; it completes during this step's forward.
-        t = torch.zeros([self.dp_size], dtype=torch.int32, device="cpu")
-        t[self.dp_rank] = self._count_waiting_tp()
-        self._dtp_async_tensor = t
-        self._dtp_async_handle = dist.all_reduce(
-            t, op=dist.ReduceOp.SUM, group=self.dp_group, async_op=True)
+    def _dtp_admission_barrier(self) -> None:
+        """Cross-engine TP admission barrier.
+
+        Keeps the merged DP engines' per-step scheduling in lockstep while in TP
+        mode: cap the number of new TP requests each engine admits this step to
+        the *minimum* available across all merged engines, so requests that have
+        arrived at only some engines wait a step until every engine has them —
+        guaranteeing an identical TP batch.
+
+        It runs on the process group of the engines that are actually merged
+        (`_dtp_barrier_group`), not on the DP group: with the deployment split
+        into several merged groups, each group's busy loop is driven by its own
+        traffic, so a DP-wide collective here would pair a group that reached the
+        barrier with one that has not.
+
+        MUST be called once per busy-loop iteration on *every* engine of the
+        merged group, and `long_request_execution_mode` is the only predicate
+        allowed to gate it — that flag is flipped identically on all of the
+        group's engines by the sync in `_has_global_unfinished_reqs_simple`.
+
+        In particular it must NOT be gated on local scheduler state. This used to
+        live in `step()` behind its `has_requests()` early return, which
+        deadlocks: a TP request is dispatched to every merged engine but does not
+        land in all of their input queues in the same iteration, so the engine
+        that already has it enters this all-reduce while the engine that does not
+        falls through to `execute_dummy_batch()` ->
+        `coordinate_batch_across_dp()`. Two different collectives on the same
+        process group, both engines block forever. That deadlock needs no load at
+        all — it fires on the first request scheduled after a DP->TP switch.
+        """
+        if not self.scheduler.long_request_execution_mode:
+            self._dtp_lockstep_step = 0
+            self.scheduler.want_to_exit_long_request = False
+            self.scheduler.exit_long_request_now = False
+            return
+
+        # Only run the barrier (and admit new TP requests) every Nth TP step; on
+        # the other steps admit nothing and just decode, which keeps the merged
+        # engines aligned without the per-step gloo all-reduce. The counter is
+        # lockstep-identical across engines (it advances only in TP mode), so they
+        # all choose the same sync steps.
+        if self._dtp_lockstep_step % self._dtp_sync_every == 0:
+            pg, gsize, grank = self._dtp_barrier_group()
+            cap, any_exit, all_exit = ParallelConfig.sync_TP_barrier(
+                pg, gsize, grank,
+                self._count_waiting_tp(),
+                self.scheduler.want_to_exit_long_request,
+            )
+            # Someone wants out: nobody admits anything more, so every engine
+            # keeps decoding the identical running set while the rest of them
+            # notice the switch request. Without this the engine that has seen it
+            # would stop admitting on its own while the others kept going, and
+            # their batches would diverge mid-vote.
+            self.scheduler.TP_execute_number = 0 if any_exit else cap
+            # Every engine has voted -> all of them leave TP mode on this step.
+            # This is the TP->DP counterpart of the DP->TP agreement in
+            # `_has_global_unfinished_reqs_simple`; leaving TP mode used to be a
+            # purely local decision taken the moment the switch request reached
+            # an engine's queue head, so if it arrived a step apart one engine
+            # ran in DP mode while the other was still merged, and the next
+            # collective hung both (observed as `RPC call to execute_model timed
+            # out` in 1 run of 6).
+            self.scheduler.exit_long_request_now = all_exit
+        else:
+            self.scheduler.TP_execute_number = 0
+        self._dtp_lockstep_step += 1
 
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
@@ -410,54 +507,36 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-
-        # Keep the merged DP engines' per-step scheduling in lockstep while in TP
-        # mode: cap the number of new TP requests each engine admits this step to
-        # the *minimum* available across all merged engines. The all-reduce is a
-        # barrier both engines reach (each TP request is dispatched to all of
-        # them), so requests that have arrived at only some engines wait one step
-        # until every engine has them — guaranteeing an identical TP batch and
-        # avoiding the DTP all-reduce shape mismatch / stall that otherwise occurs
-        # at low/sparse load.
-        if self.scheduler.long_request_execution_mode and self._dtp_async_barrier:
-            self._dtp_async_barrier_step()
-        elif self.scheduler.long_request_execution_mode:
-            # Only run the barrier (and admit new TP requests) every Nth TP step;
-            # on the other steps admit nothing and just decode, which keeps the
-            # merged engines aligned without the per-step gloo all-reduce. The
-            # counter is lockstep-identical across engines (it advances only in TP
-            # mode), so they all choose the same sync steps.
-            if self._dtp_lockstep_step % self._dtp_sync_every == 0:
-                tp_requests_counter = 0
-                for request in self.scheduler.waiting:
-                    if len(request.long_request_engines) > 1:
-                        tp_requests_counter += 1
-                    else:
-                        break
-                self.scheduler.TP_execute_number = (
-                    ParallelConfig.sync_TP_requests_number(
-                        self.dp_group, self.dp_size, self.dp_rank,
-                        tp_requests_counter,
-                    )
-                )
-            else:
-                self.scheduler.TP_execute_number = 0
-            self._dtp_lockstep_step += 1
-        else:
-            self._dtp_lockstep_step = 0
-            if self._dtp_async_handle is not None:
-                self._dtp_async_handle.wait()  # drain on exit from TP mode
-                self._dtp_async_handle = None
-            self._dtp_was_tp = False
+        # NOTE: the cross-engine TP admission barrier used to run here, right
+        # after this early return. It cannot: see `_dtp_admission_barrier`,
+        # which the DP busy loop now calls before every step instead.
 
         scheduler_output = self.scheduler.schedule()
+
+        if DTP_DEBUG and self.scheduler.long_request_execution_mode:
+            # The merged engines must build an IDENTICAL batch every step. When
+            # they do not, the per-layer all-reduce blocks on mismatched shapes
+            # and the group wedges -- so log what each engine actually built.
+            logger.info(
+                "[DTP-dbg] dp%s tp-step cap=%s new=%d tokens=%d waiting=%d run=%d",
+                getattr(self, "dp_rank", None),
+                self.scheduler.TP_execute_number,
+                len(scheduler_output.scheduled_new_reqs),
+                scheduler_output.total_num_scheduled_tokens,
+                len(self.scheduler.waiting), len(self.scheduler.running))
 
         # Apply a pending DP<->TP mode transition atomically across all workers
         # before model execution (Step 5 of the dynamic scheduling protocol).
         if scheduler_output.set_dtp_group_status:
-            self.collective_rpc("worker_set_dtp_group_state", args=(True,))
+            # The merged engine set rides along: the workers need it for batches
+            # that never reach `execute_model`'s `dtp_context` (dummy batches),
+            # which otherwise use a stale set and all-reduce on a communicator
+            # they are not part of. See `worker_set_dtp_group_state`.
+            self.collective_rpc(
+                "worker_set_dtp_group_state",
+                args=(True, list(self.scheduler.long_request_engines or ())))
         if scheduler_output.reset_dtp_group_status:
-            self.collective_rpc("worker_set_dtp_group_state", args=(False,))
+            self.collective_rpc("worker_set_dtp_group_state", args=(False, None))
 
         with self.log_error_detail(scheduler_output):
             model_output = self.model_executor.execute_model(scheduler_output)
@@ -465,13 +544,6 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
-        
-        if engine_core_outputs:
-            if engine_core_outputs[0].switch_dtp_group_state:
-                self.collective_rpc("worker_set_dtp_group_state", args=(False,))
-                if self.scheduler.set_kv_cache_config_already:
-                    self.kv_cache_config_reset(scheduler_output)
-                    self.scheduler.set_kv_cache_config_already = False
         
         # not all the dtp ranks return the result to the coordinator
         if self.scheduler.long_request_execution_mode:
@@ -1248,9 +1320,18 @@ class DPEngineCoreProc(EngineCoreProc):
 
         self.dp_rank = dp_rank
         self.dp_group = vllm_config.parallel_config.stateless_init_dp_group()
+        # One gloo group per mergeable engine subset this engine belongs to. The
+        # admission barrier runs on the subset that is actually merged, not on
+        # the whole DP group: at merge width 2 the two groups iterate their busy
+        # loops independently, so a DP-wide collective would deadlock them
+        # against each other.
+        self.dtp_subgroups = (
+            vllm_config.parallel_config.stateless_init_dp_subgroups())
 
     def shutdown(self):
         super().shutdown()
+        for pg in getattr(self, "dtp_subgroups", {}).values():
+            stateless_destroy_torch_distributed_process_group(pg)
         if dp_group := getattr(self, "dp_group", None):
             stateless_destroy_torch_distributed_process_group(dp_group)
 
@@ -1303,6 +1384,13 @@ class DPEngineCoreProc(EngineCoreProc):
             # 1) Poll the input queue until there is work to do.
             self._process_input_queue()
 
+            # 1.5) Cross-engine TP admission barrier. Runs on every merged engine
+            # in every iteration while in TP mode — including engines that have
+            # no local work this iteration and will only issue a dummy batch
+            # below. Skipping it on those engines mismatches the collectives on
+            # the DP group and deadlocks; see `_dtp_admission_barrier`.
+            self._dtp_admission_barrier()
+
             # 2) Step the engine core.
             # Record time for _process_engine_step
             executed = self._process_engine_step()
@@ -1319,19 +1407,13 @@ class DPEngineCoreProc(EngineCoreProc):
                 # if the model didn't execute any ready requests.
                 self.execute_dummy_batch()
 
-            # 3) All-reduce operation to determine global unfinished reqs.
-            # TODO: sync the want_to_execute_long_request across all the DP ranks here.
-            # self.engines_running = self._has_global_unfinished_reqs(
-            #     local_unfinished_reqs
-            # )
-            # Record time for _has_global_unfinished_reqs_simple
+            # 3) All-reduce to determine global unfinished reqs. The DTP
+            # variant of upstream's `_has_global_unfinished_reqs`: it carries the
+            # switch-readiness vote in the same collective, so entering TP mode
+            # costs no extra round-trip.
             self.engines_running = self._has_global_unfinished_reqs_simple(
                 local_unfinished_reqs
             )
-            
-            # 2.5) Check if long request will be executed next step and
-            # TODO: check which engine should start the long request execution.
-            # self._syn_long_request()
 
             if not self.engines_running:
                 if self.dp_rank == 0 or not self.has_coordinator:
@@ -1376,10 +1458,17 @@ class DPEngineCoreProc(EngineCoreProc):
             self.scheduler.want_to_execute_long_request
         )
         
-        want_to_execute_long_request = bool(tensor[:, 1].min().item())
-        want_to_execute_same_long_request = bool((tensor[:, 2] == tensor[0, 2]).all().item())
-        
-        if want_to_execute_long_request and want_to_execute_same_long_request:
+        if DTP_DEBUG:
+            logger.info(
+                "[DTP-dbg] dp%s vote unfinished=%s want=%s id=%s masks=%s "
+                "agreed=%s tp_mode=%s waiting=%d",
+                self.dp_rank, tensor[:, 0].tolist(), tensor[:, 1].tolist(),
+                tensor[:, 2].tolist(), tensor[:, 3:3 + self.dp_size].tolist(),
+                dtp_switch_agreed(tensor, self.dp_rank, self.dp_size),
+                self.scheduler.long_request_execution_mode,
+                len(self.scheduler.waiting))
+
+        if dtp_switch_agreed(tensor, self.dp_rank, self.dp_size):
             self._sync_long_request_status()
             
             self.scheduler.long_request_execution_mode = True
@@ -1400,8 +1489,12 @@ class DPEngineCoreProc(EngineCoreProc):
                 request.status, 
                 request._output_token_ids
             )
+        # Only the engines that are merging exchange this: it runs on the step
+        # they enter TP mode together, and engines outside the group are not in
+        # that step at all.
+        pg, _, _ = self._dtp_barrier_group()
         synced_pre_executed_TP_requests = ParallelConfig.sync_pre_executed_TP_requests(
-            self.dp_group,
+            pg,
             pre_executed_TP_requests
         )
         
@@ -1411,132 +1504,6 @@ class DPEngineCoreProc(EngineCoreProc):
         
         self.scheduler._merge_pre_executed_TP_requests(merged)
     
-    def _has_global_unfinished_reqs_and_switch_mode(self, local_unfinished: bool) -> bool:
-        # Optimization - only perform finish-sync all-reduce every 8 steps.
-        self.step_counter += 1
-        if self.step_counter % 8 != 0:
-            return True
-
-        has_unfinished, tensor = ParallelConfig.has_unfinished_dp_and_switch_mode(
-            self.dp_group,
-            local_unfinished,
-            self.dp_size,
-            self.dp_rank,
-            self.scheduler.pending_long_request_sync_id,
-            self.scheduler.long_request_engines,
-            self.scheduler.want_to_execute_long_request
-        )
-        
-        if tensor is not None:
-            # tensor is a 2D tensor with shape (dp_size, 3+dp_size)
-            # the first column is the has_unfinished
-            # the second column is the want_to_execute_long_request
-            # the third column is the deterministic_hash(sync_long_request)
-            # the rest columns are the engine flags, if the flag is 1, means the engine will
-            # execute the long request
-            has_unfinished = bool(tensor[:, 0].sum().item())
-            want_to_execute_long_request = bool(tensor[:, 1].sum().item())
-            
-            # If any rank wants to execute long request, extract information from tensor
-            if want_to_execute_long_request:
-                # Step 1: Collect all rank requests with their sync_hash and required engine indices
-                rank_requests = {}
-                for rank in range(self.dp_size):
-                    if tensor[rank, 1].item() == 1:  # This rank wants to execute long request
-                        sync_hash = tensor[rank, 2].item()
-                        # Extract engine indices from engine flags (columns 3 to 3+dp_size)
-                        engine_flags = tensor[rank, 3:3+self.dp_size]
-                        eng_indices = [idx for idx in range(self.dp_size) 
-                                     if engine_flags[idx].item() == 1]
-                        
-                        if sync_hash != 0 and eng_indices:
-                            rank_requests[rank] = (sync_hash, eng_indices)
-                
-                # Step 2: Group requests by sync_hash to identify unique requests
-                # For each sync_hash, determine the required engines set and source ranks
-                request_groups = {}
-                for rank, (sync_hash, eng_indices) in rank_requests.items():
-                    if sync_hash not in request_groups:
-                        request_groups[sync_hash] = {
-                            'required_engines': set(),
-                            'source_ranks': set()
-                        }
-                    request_groups[sync_hash]['required_engines'].update(eng_indices)
-                    request_groups[sync_hash]['source_ranks'].add(rank)
-                
-                # Step 3: For each request (sync_hash), check if it can execute
-                # A request can execute if:
-                #   1. required_engines == source_ranks (all required engines are source ranks)
-                #   2. All required engines are not already assigned to another request
-                # This simplifies the logic: if all required engines are source ranks,
-                # they are all ready (since we only collected ranks that want_to_execute)
-                valid_requests = {}  # sync_hash -> eng_indices that can execute
-                busy_engines = set()  # Track engines that are already assigned
-                
-                # Process requests in sorted order (by sync_hash) for deterministic behavior
-                for sync_hash in sorted(request_groups.keys()):
-                    req_info = request_groups[sync_hash]
-                    required_engines = req_info['required_engines']
-                    source_ranks = req_info['source_ranks']
-                    
-                    # Simplified check: required_engines must equal source_ranks
-                    # This means all required engines are source ranks (they all want to execute)
-                    if required_engines == source_ranks:
-                        # Check if any required engine is already assigned to another request
-                        # All required engines are ready and available
-                        eng_indices_list = sorted(required_engines)
-                        valid_requests[sync_hash] = eng_indices_list
-                        busy_engines.update(required_engines)
-                
-                # Step 4: Check if current rank should execute long request
-                if self.scheduler.pending_long_request_sync_id: 
-                    current_sync_hash = ParallelConfig._deterministic_hash(self.scheduler.pending_long_request_sync_id)
-                else:
-                    current_sync_hash = 0
-                
-                if current_sync_hash in valid_requests:
-                    eng_indices = valid_requests[current_sync_hash]
-                    if self.dp_rank in eng_indices:
-                        self.scheduler.long_request_execution_mode = True
-                        self.scheduler.long_request_engines = eng_indices
-        
-        return has_unfinished
-    
-    def _syn_long_request(self):
-        # Synchronize the long request string across all DP ranks
-        long_request_synced = self._sync_long_request_across_dp_ranks(
-            self.scheduler.pending_long_request_sync_id,
-            self.scheduler.long_request_engines)
-        # logger.info(f"long_request_synced: {long_request_synced}")
-        # if one of the DP ranks has the long request synced
-        if long_request_synced:
-            # Sort the long_request_synced dictionary based on rank
-            busy_engines = {}
-            for rank, (sync_long_request, eng_indices) in sorted(
-                (kv for d in long_request_synced if d is not None for kv in d.items()),
-                key=lambda x: x[0]
-            ):
-                # check if the needed engines are busy or the eng_indices is empty
-                if rank in busy_engines or not eng_indices:
-                    continue
-                else:
-                    for engine_index in eng_indices:
-                        busy_engines[engine_index] = (sync_long_request, eng_indices)
-            
-            if self.dp_rank in busy_engines:
-                self.scheduler.long_request_execution_mode = True
-                self.scheduler.pending_long_request_sync_id = busy_engines[self.dp_rank][0]
-                self.scheduler.long_request_engines = busy_engines[self.dp_rank][1]
-        
-    def _sync_long_request_across_dp_ranks(self, 
-                                           sync_long_request: str, 
-                                           eng_indices: list[int]) \
-                                               -> dict[int, tuple[str, list[int]]]:
-        # sync the sync_long_request string across all DP ranks
-        return ParallelConfig.sync_long_request_across_dp_ranks(self.dp_group, 
-                                                               sync_long_request, 
-                                                               eng_indices)
-
     def reinitialize_distributed(
         self, reconfig_request: ReconfigureDistributedRequest
     ) -> None:

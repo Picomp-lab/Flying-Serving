@@ -178,9 +178,6 @@ class SchedulerOutput:
     # Long request synchronization ID that is being scheduled
     pending_long_request_sync_id: Optional[str] = None
     
-    # Whether to switch the DTP group state
-    switch_dtp_group_state: bool = False
-    
     # Long request engine IDs
     long_request_engine_ids: Optional[list[int]] = field(default_factory=lambda: [0, 1])
 

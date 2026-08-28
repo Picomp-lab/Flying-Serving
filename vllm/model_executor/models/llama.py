@@ -28,6 +28,8 @@ from collections.abc import Iterable
 from itertools import islice
 from typing import Any
 
+import os
+
 import torch
 from torch import nn
 from transformers import LlamaConfig
@@ -113,6 +115,7 @@ class LlamaMLP(nn.Module):
         x = self.act_fn(x)
         x, _ = self.down_proj(x)
         return x
+
 
 
 class LlamaAttention(nn.Module):
@@ -330,8 +333,44 @@ class LlamaDecoderLayer(nn.Module):
         )
         
         self.dtp_context_switch_status = False
+        # The engine set this layer is currently configured for. A bare boolean
+        # is not enough: the merge set can change from one TP episode to the
+        # next, and a layer that only knows "I am merged" keeps the previous
+        # episode's all-reduce group and head split.
+        self.dtp_configured_ids: tuple[int, ...] | None = None
         self.original_status = {}
-        
+
+    def _dtp_restore(self) -> None:
+        """Undo this layer's merged-TP configuration.
+
+        Split out of `dtp_context` so it can also run when the merge set changes
+        *without* an intervening DP-mode forward: the new configuration has to be
+        applied on top of the unmerged one, never on top of another episode's.
+        """
+        attn = self.self_attn
+        attn.o_proj.tp_size = self.original_status["o_proj_tp_size"]
+        self.mlp.down_proj.tp_size = self.original_status["down_proj_tp_size"]
+
+        attn.attn.num_heads = self.original_status["num_heads"]
+        attn.attn.num_kv_heads = self.original_status["num_kv_heads"]
+
+        attn.q_size = self.original_status["q_size"]
+        attn.kv_size = self.original_status["kv_size"]
+
+        kv = attn.attn.kv_cache[0]
+        attn.attn.kv_cache[0] = kv.view(
+            kv.shape[0], kv.shape[1],
+            self.original_status["original_block_size"],
+            self.original_status["original_kv_head_num"],
+            kv.shape[4])
+
+        self.dtp_context_switch_status = False
+        for k in ("o_proj_tp_size", "down_proj_tp_size", "num_heads",
+                  "num_kv_heads", "q_size", "kv_size",
+                  "original_block_size", "original_kv_head_num"):
+            self.original_status[k] = None
+
+
     @contextmanager
     def dtp_context(self, long_request_engine_ids: tuple[int, ...]):
         """Temporarily switch to DTP context.
@@ -342,35 +381,27 @@ class LlamaDecoderLayer(nn.Module):
         """
         if not get_dtp_group_state():
             if self.dtp_context_switch_status:
-                self.self_attn.o_proj.tp_size = self.original_status["o_proj_tp_size"]
-                self.mlp.down_proj.tp_size = self.original_status["down_proj_tp_size"]
-                
-                self.self_attn.attn.num_heads = self.original_status["num_heads"]
-                self.self_attn.attn.num_kv_heads = self.original_status["num_kv_heads"]
-                
-                self.self_attn.q_size = self.original_status["q_size"]
-                self.self_attn.kv_size = self.original_status["kv_size"]
-                
-                self.self_attn.attn.kv_cache[0] = self.self_attn.attn.kv_cache[0].view(self.self_attn.attn.kv_cache[0].shape[0], 
-                                                self.self_attn.attn.kv_cache[0].shape[1], 
-                                                self.original_status["original_block_size"], self.original_status["original_kv_head_num"], 
-                                                self.self_attn.attn.kv_cache[0].shape[4])
-                self.dtp_context_switch_status = False
-                self.original_status["o_proj_tp_size"] = None
-                self.original_status["down_proj_tp_size"] = None
-                self.original_status["num_heads"] = None
-                self.original_status["num_kv_heads"] = None
-                self.original_status["q_size"] = None
-                self.original_status["kv_size"] = None
-                self.original_status["original_block_size"] = None
-                self.original_status["original_kv_head_num"] = None
+                self._dtp_restore()
+                self.dtp_configured_ids = None
             yield
             return
 
+        long_request_engine_ids = tuple(long_request_engine_ids)
         if self.dtp_context_switch_status:
-            yield
-            return
-    
+            if self.dtp_configured_ids == long_request_engine_ids:
+                yield
+                return
+            # The merge set changed and no DP-mode forward ran in between to
+            # reset this layer -- which happens whenever one TP episode is
+            # followed by another at a different width. Without this the layer
+            # keeps the previous episode's engine ids, so its o_proj/down_proj
+            # all-reduce runs over the OLD group: at width 4 after a width-2
+            # episode each rank sums two partial products instead of four and
+            # the attention output comes out short, silently degrading the model
+            # (+9.5% NLL) with no error anywhere.
+            self._dtp_restore()
+
+        self.dtp_configured_ids = long_request_engine_ids
         self.dtp_context_switch_status = True
         self.original_status["o_proj_tp_size"] = self.self_attn.o_proj.tp_size
         self.original_status["down_proj_tp_size"] = self.mlp.down_proj.tp_size
