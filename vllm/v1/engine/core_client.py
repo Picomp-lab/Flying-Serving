@@ -52,6 +52,14 @@ from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
 logger = init_logger(__name__)
 
+# Default DP<->TP switch method. `hard-preempt` rather than `sequential`:
+# sequential waits for the cohort of requests that were running when the switch
+# request arrived, which measured 9-16 s against hard-preempt's 0.2-1.0 s on the
+# same workloads, never fires at all on an idle deployment, and has no working
+# TP->DP path (its exit vote is not collective and the barrier times out).
+# Override with VLLM_DTP_SWITCH_METHOD=sequential.
+DEFAULT_SWITCH_METHOD = os.environ.get("VLLM_DTP_SWITCH_METHOD", "hard-preempt")
+
 AnyFuture: TypeAlias = asyncio.Future[Any] | Future[Any]
 
 _R = TypeVar("_R")  # Return type for collective_rpc
@@ -1160,6 +1168,8 @@ class DPAsyncMPClient(AsyncMPClient):
             await self.add_request_async_manipulated(request)
         elif work_mode == 'switch_test':
             await self.add_request_async_switch_test(request)
+        elif work_mode == 'width':
+            await self.add_request_async_width(request)
         else:
             raise ValueError(f"Invalid work mode: {work_mode}")
         
@@ -1208,12 +1218,12 @@ class DPAsyncMPClient(AsyncMPClient):
         if self.step_count in switch_start_steps:
             request.switch_running_mode_flag = True
             request.switch_mode = 'DP'
-            request.switch_method = 'hard-preempt'
+            request.switch_method = DEFAULT_SWITCH_METHOD
             self.running_mode = 'DP'
         elif self.step_count in switch_end_steps:
             request.switch_running_mode_flag = True
             request.switch_mode = 'TP'
-            request.switch_method = 'sequential'
+            request.switch_method = DEFAULT_SWITCH_METHOD
             self.running_mode = 'TP'
         else:
             request.switch_running_mode_flag = False
@@ -1259,11 +1269,11 @@ class DPAsyncMPClient(AsyncMPClient):
         if self.step_count in [0, 16]:
             request.switch_running_mode_flag = True
             request.switch_mode = 'TP'
-            request.switch_method = 'sequential'
+            request.switch_method = DEFAULT_SWITCH_METHOD
         if self.step_count in [3]:
             request.switch_running_mode_flag = True
             request.switch_mode = 'DP'
-            request.switch_method = 'hard-preempt'
+            request.switch_method = DEFAULT_SWITCH_METHOD
         self.step_count += 1
         
         request.long_request_engines = engine_indices
@@ -1294,7 +1304,7 @@ class DPAsyncMPClient(AsyncMPClient):
         if self.step_count in [0]:
             request.switch_running_mode_flag = True
             request.switch_mode = 'TP'
-            request.switch_method = 'sequential'
+            request.switch_method = DEFAULT_SWITCH_METHOD
         
         request.long_request_engines = engine_indices
         request.is_long_request = True
@@ -1339,8 +1349,10 @@ class DPAsyncMPClient(AsyncMPClient):
         self._ensure_stats_update_task()
 
         period = max(1, int(os.environ.get("VLLM_DTP_SWITCH_PERIOD", "40")))
-        to_tp_method = os.environ.get("VLLM_DTP_TO_TP_METHOD", "sequential")
-        to_dp_method = os.environ.get("VLLM_DTP_TO_DP_METHOD", "hard-preempt")
+        to_tp_method = os.environ.get("VLLM_DTP_TO_TP_METHOD",
+                                      DEFAULT_SWITCH_METHOD)
+        to_dp_method = os.environ.get("VLLM_DTP_TO_DP_METHOD",
+                                      DEFAULT_SWITCH_METHOD)
 
         request.current_wave = self.current_wave
         request.client_index = self.client_index
@@ -1385,6 +1397,127 @@ class DPAsyncMPClient(AsyncMPClient):
             req_msg = msgspec.msgpack.encode(("FIRST_REQ", chosen_engines[0]))
             await self.first_req_send_socket.send(req_msg)
 
+        await asyncio.gather(*send_tasks)
+
+        self._ensure_output_queue_task()
+
+    # ------------------------------------------------------------------
+    # Externally driven merge width ('width' work mode)
+    # ------------------------------------------------------------------
+    #
+    # The shipped policies decide the layout from the request stream, which is
+    # right for serving and useless for measurement: a benchmark has to hold a
+    # layout still long enough to measure it, then move to the next one. This
+    # mode takes the layout from an operator instead (`/dtp_switch`), so a run
+    # can walk the whole merge hierarchy -- 4 engines -> 2 groups of 2 -> 1 group
+    # of 4 -> back -- and bench each width as a stage.
+    #
+    # "Width" is the number of engines merged into one TP group; the deployment
+    # always splits into `dp_size // width` such groups, so every width uses
+    # every GPU. Width 1 is plain DP.
+
+    def _dtp_init_width_state(self) -> None:
+        if hasattr(self, "_dtp_width"):
+            return
+        self._dtp_width: int = 1
+        self._dtp_groups: list[tuple[int, ...]] = []
+        # (group, 'TP'|'DP', method) — one switch request still to be emitted.
+        self._dtp_pending: list[tuple[tuple[int, ...], str, str]] = []
+        self._dtp_rr: int = 0
+
+    def dtp_status(self) -> dict:
+        self._dtp_init_width_state()
+        return {
+            "merge_width": self._dtp_width,
+            "groups": [list(g) for g in self._dtp_groups],
+            "dp_size": len(self.core_engines),
+            "pending_switches": [
+                {"engines": list(g), "to": mode, "method": method}
+                for g, mode, method in self._dtp_pending
+            ],
+        }
+
+    def request_dtp_width(self, width: int,
+                          method: str = DEFAULT_SWITCH_METHOD) -> dict:
+        """Queue the switch requests that move the deployment to `width`.
+
+        Nothing is sent here: a switch is carried *by a request* (the engines
+        agree on it through the request's id), so the queued transitions ride
+        out on the next arrivals. Under live load that is the next few
+        milliseconds; with no traffic at all nothing happens until a request
+        shows up, which is inherent to the design, not a stall.
+        """
+        self._dtp_init_width_state()
+        n = len(self.core_engines)
+        if width < 1 or width > n or n % width:
+            raise ValueError(
+                f"merge width {width} must divide data_parallel_size={n}")
+        if self._dtp_pending:
+            raise RuntimeError(
+                f"a switch to width {self._dtp_width} is still pending "
+                f"({len(self._dtp_pending)} switch request(s) not yet emitted)")
+        if width == self._dtp_width:
+            return self.dtp_status()
+        if self._dtp_width > 1 and width > 1:
+            # Merged engines re-shard from their resident DP replica, so a group
+            # reaches a new width by splitting back to DP and re-merging; it
+            # cannot re-cut a live TP group the way elastic TP reshards weights.
+            raise ValueError(
+                f"cannot go from width {self._dtp_width} straight to {width}: "
+                "split back to width 1 first")
+
+        if width == 1:
+            self._dtp_pending = [(g, 'DP', method) for g in self._dtp_groups]
+            self._dtp_groups = []
+        else:
+            groups = [tuple(range(s, s + width)) for s in range(0, n, width)]
+            self._dtp_pending = [(g, 'TP', method) for g in groups]
+            self._dtp_groups = groups
+        self._dtp_width = width
+        logger.info("[DTP] merge width -> %d via %s; %d switch request(s) queued",
+                    width, method, len(self._dtp_pending))
+        return self.dtp_status()
+
+    async def add_request_async_width(self, request: EngineCoreRequest) -> None:
+        self._ensure_stats_update_task()
+        self._dtp_init_width_state()
+
+        request.current_wave = self.current_wave
+        request.client_index = self.client_index
+
+        if self._dtp_pending:
+            group, mode, method = self._dtp_pending.pop(0)
+            request.switch_running_mode_flag = True
+            request.switch_mode = mode
+            request.switch_method = method
+            engine_indices = list(group)
+            logger.info("[DTP] request %s switches engines %s to %s via %s",
+                        request.request_id, engine_indices, mode, method)
+        else:
+            request.switch_running_mode_flag = False
+            if self._dtp_groups:
+                # Steady state at width > 1: one group per request, round-robin.
+                # A merged group runs an identical batch on every one of its
+                # engines, so the request goes to all of them.
+                group = self._dtp_groups[self._dtp_rr % len(self._dtp_groups)]
+                self._dtp_rr += 1
+                engine_indices = list(group)
+            else:
+                chosen = self.get_core_engine_for_request_original(request)
+                engine_indices = [self.core_engines.index(chosen)]
+
+        request.long_request_engines = engine_indices
+        request.is_long_request = len(engine_indices) > 1
+        request.long_request_engine_num = len(engine_indices)
+
+        chosen_engines = [self.core_engines[i] for i in engine_indices]
+        send_tasks = [
+            self._send_input(EngineCoreRequestType.ADD, request, engine)
+            for engine in chosen_engines
+        ]
+        if not self.engines_running and len(self.core_engines) > 1:
+            req_msg = msgspec.msgpack.encode(("FIRST_REQ", chosen_engines[0]))
+            await self.first_req_send_socket.send(req_msg)
         await asyncio.gather(*send_tasks)
 
         self._ensure_output_queue_task()

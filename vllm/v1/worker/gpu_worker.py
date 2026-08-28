@@ -525,6 +525,16 @@ class Worker(WorkerBase):
                 )
 
     def execute_dummy_batch(self) -> None:
+        if os.environ.get("VLLM_DTP_DEBUG", "0") == "1":
+            from vllm.distributed.parallel_state import get_dtp_group_state
+            inner = getattr(getattr(self, "model_runner", None), "model", None)
+            logger.info(
+                "[DTP-dbg] worker rank %s dummy_batch dtp_state=%s model_ids=%s "
+                "runner_ids=%s",
+                self.rank, get_dtp_group_state(),
+                getattr(getattr(inner, "model", None),
+                        "long_request_engine_ids", "<none>"),
+                getattr(self.model_runner, "long_request_engine_ids", "<none>"))
         self.model_runner._dummy_run(1, uniform_decode=True)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
@@ -758,13 +768,48 @@ class Worker(WorkerBase):
         if runner := getattr(self, "model_runner", None):
             runner.ensure_kv_transfer_shutdown()
     
-    def worker_set_dtp_group_state(self, state: bool) -> None:
+    def worker_set_dtp_group_state(
+        self, state: bool, engine_ids: list[int] | None = None
+    ) -> None:
         """Set the per-process DTP group state on this worker process.
 
         This is invoked via collective_rpc across all workers so each process
         updates its own local group state consistently.
+
+        `engine_ids` is the set of DP engines that just merged. It has to be
+        pushed here, at the transition, and not only inside `execute_model`'s
+        `dtp_context`: a *dummy* batch runs the model with the DTP path active
+        (the layers gate on the process-wide state flag) but never enters that
+        context, so it uses whatever engine set the model was last told about.
+        The model's initial value is a hard-coded `(0, 1)`, which is the right
+        answer only when data_parallel_size == 2 -- the layout this was
+        developed against. With four engines merged as two groups, an engine of
+        group (2,3) that issues a dummy batch before its first merged batch
+        all-reduces on `_DTP[(0,1)]`, a communicator it is not a member of, and
+        blocks forever.
         """
         set_dtp_group_state(state)
+        runner = getattr(self, "model_runner", None)
+        if runner is not None:
+            # Drive the KV-layout transition from here rather than from
+            # `execute_model`'s `dtp_context`. That context is reached only on a
+            # step that actually schedules tokens, and the step which leaves TP
+            # mode frequently schedules none -- the hard-preempt exit frees the
+            # KV of everything in flight and re-queues it. An engine that skips
+            # it keeps the *previous* episode's block_size and kv-head split
+            # while the model's per-layer view follows the new one, so the slot
+            # a token is written to is no longer the slot attention reads. The
+            # symptom is silent: that rank's attention returns whatever lives at
+            # the address it read (zeros for a block this width has not touched
+            # yet), the merged all-reduce sums it in, and the model degrades
+            # (+9.5% NLL at merge width 4 after a width-2 episode) with no error
+            # and no hang. This RPC, unlike `execute_model`, runs on every
+            # engine of the group at the exact step the flag flips.
+            if state:
+                runner.dtp_apply_layout(engine_ids or
+                                        runner.long_request_engine_ids)
+            else:
+                runner.dtp_undo_layout()
 
 
 def init_worker_distributed_environment(

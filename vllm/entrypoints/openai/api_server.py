@@ -1136,6 +1136,74 @@ async def is_scaling_elastic_ep(raw_request: Request):
     return JSONResponse({"is_scaling_elastic_ep": _scaling_elastic_ep})
 
 
+def _dtp_core_client(raw_request: Request):
+    """The DP core client, which owns the DP<->TP routing policy."""
+    core = getattr(engine_client(raw_request), "engine_core", None)
+    if core is None or not hasattr(core, "request_dtp_width"):
+        raise HTTPException(
+            status_code=400,
+            detail="DP<->TP switching is not available on this engine "
+            "(needs a multi-engine DP deployment)")
+    return core
+
+
+@router.get("/dtp_status")
+async def dtp_status(raw_request: Request):
+    """Current DP<->TP layout as the router sees it.
+
+    This is the *requested* layout: the engines apply a switch when the request
+    carrying it reaches them, so a status read taken between `/dtp_switch` and
+    the next arrival reports the new width while the engines are still on the
+    old one. The engine-side transition is logged by the scheduler
+    ("dp rank N DP --> TP" / "switch TP -> DP").
+    """
+    return JSONResponse(_dtp_core_client(raw_request).dtp_status())
+
+
+@router.post(
+    "/dtp_switch",
+    dependencies=[Depends(validate_json_request)],
+    responses={
+        HTTPStatus.OK.value: {"model": dict},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.CONFLICT.value: {"model": ErrorResponse},
+    },
+)
+async def dtp_switch(raw_request: Request):
+    """Set the merge width: how many DP engines form one TP group.
+
+    Body: ``{"width": 2, "method": "hard-preempt"|"sequential"}``. The
+    deployment splits into ``data_parallel_size // width`` groups, so every
+    width keeps all the GPUs serving -- width 1 is plain DP, width
+    ``data_parallel_size`` is one TP group across the whole deployment.
+
+    Only transitions to and from width 1 are legal: a merged group re-shards
+    from its resident DP replica, so it splits back before re-merging.
+    """
+    try:
+        body = await raw_request.json()
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON format") from e  # noqa: B904
+
+    width = body.get("width")
+    from vllm.v1.engine.core_client import DEFAULT_SWITCH_METHOD
+    method = body.get("method", DEFAULT_SWITCH_METHOD)
+    if not isinstance(width, int) or width < 1:
+        raise HTTPException(status_code=400, detail="width must be a positive integer")
+    if method not in ("hard-preempt", "sequential"):
+        raise HTTPException(
+            status_code=400,
+            detail="method must be 'hard-preempt' or 'sequential'")
+
+    core = _dtp_core_client(raw_request)
+    try:
+        return JSONResponse(core.request_dtp_width(width, method))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
+
+
 # TODO: RequestType = TypeForm[BaseModel] when recognized by type checkers
 # (requires typing_extensions >= 4.13)
 RequestType = Any

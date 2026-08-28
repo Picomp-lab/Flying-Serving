@@ -314,6 +314,110 @@ class ParallelConfig:
 
         return answer
 
+    @staticmethod
+    def dtp_merge_sets(dp_size: int) -> list[tuple[int, ...]]:
+        """Engine subsets that may merge into one dynamic-TP group.
+
+        The default is the binary hierarchy over contiguous, aligned engine
+        ranges: for ``dp_size=4`` that is ``[(0,1), (2,3), (0,1,2,3)]``. Every
+        width in the hierarchy *tiles* the deployment, so at merge width ``w``
+        all ``dp_size`` engines are busy in ``dp_size // w`` groups. That tiling
+        is the whole difference between DP<->TP switching and elastic TP:
+        narrowing an elastic-TP group idles the GPUs it releases, whereas
+        halving the merge width here doubles the number of groups.
+
+        Enumerating *every* subset — what the (unused)
+        ``add_more_parallel_groups_v0`` did with ``itertools.combinations`` —
+        would cost one communicator per subset for layouts no policy ever
+        selects; the hierarchy needs ``dp_size - 1``.
+
+        Override with ``VLLM_DTP_MERGE_SETS="0,1;2,3;0,1,2,3"``.
+        """
+        if dp_size < 2:
+            return []
+
+        env = os.environ.get("VLLM_DTP_MERGE_SETS", "").strip()
+        if env:
+            sets: list[tuple[int, ...]] = []
+            for part in env.split(";"):
+                part = part.strip()
+                if not part:
+                    continue
+                grp = tuple(sorted({int(x) for x in part.split(",")}))
+                if len(grp) < 2 or grp[0] < 0 or grp[-1] >= dp_size:
+                    raise ValueError(
+                        f"VLLM_DTP_MERGE_SETS: {part!r} is not a valid engine "
+                        f"subset for data_parallel_size={dp_size}")
+                if grp not in sets:
+                    sets.append(grp)
+            return sets
+
+        sets = []
+        width = 2
+        while width <= dp_size:
+            if dp_size % width == 0:
+                for start in range(0, dp_size, width):
+                    sets.append(tuple(range(start, start + width)))
+            width *= 2
+        # A dp_size that is not a power of two (6, 12, ...) never reaches the
+        # full merge in the doubling loop; it is the one layout every policy
+        # needs, so add it explicitly.
+        full = tuple(range(dp_size))
+        if full not in sets:
+            sets.append(full)
+        return sets
+
+    def stateless_init_dp_subgroups(self) -> dict[tuple[int, ...], ProcessGroup]:
+        """One gloo group per mergeable engine subset containing this engine.
+
+        The merged engines' admission barrier has to run on *exactly* the
+        engines that are merged. Running it on the full DP group instead only
+        works while every engine switches together (the single-group case):
+        with two groups merged at width 2, the engines of one group iterate
+        their busy loop at a rate set by their own traffic, so a DP-wide
+        collective would pair a group that reached it with a group that has
+        not — the same mismatched-collective deadlock that gating the barrier
+        on local scheduler state used to cause.
+
+        Ports are drawn from the shared list in the *same canonical order on
+        every engine* — including for subsets this engine is not part of — so
+        the engines that do belong to a subset agree on its rendezvous port
+        with no extra handshake.
+
+        Subgroup rank 0 binds the rendezvous port, and it is not in general
+        engine 0, so this requires the engines to be co-located (they bind on
+        `data_parallel_master_ip`). Multi-node deployments get an empty dict
+        and the single-group path.
+        """
+        from vllm.distributed.utils import (
+            stateless_init_torch_distributed_process_group,
+        )
+
+        merge_sets = ParallelConfig.dtp_merge_sets(self.data_parallel_size)
+        groups: dict[tuple[int, ...], ProcessGroup] = {}
+        if not merge_sets:
+            return groups
+
+        local_only = self.data_parallel_size_local == self.data_parallel_size
+        for grp in merge_sets:
+            # Consumed on every engine, in the same order, so the port sequence
+            # stays aligned even for subsets this engine skips below.
+            port = self.get_next_dp_init_port()
+            if not local_only and grp != tuple(range(self.data_parallel_size)):
+                continue
+            if self.data_parallel_rank not in grp:
+                continue
+            groups[grp] = stateless_init_torch_distributed_process_group(
+                self.data_parallel_master_ip,
+                port,
+                grp.index(self.data_parallel_rank),
+                len(grp),
+                backend=current_platform.dist_backend,
+            )
+        logger.info("[DTP] engine %s joined merge subgroups %s (of %s)",
+                    self.data_parallel_rank, sorted(groups), merge_sets)
+        return groups
+
     def stateless_init_dp_group(self) -> ProcessGroup:
         # NOTE: In high-concurrency scenarios multiple processes
         # can pick the same (currently free) port through a race
@@ -590,7 +694,13 @@ class ParallelConfig:
                     self.data_parallel_rank,
                 )
             if not self._data_parallel_master_port_list:
-                self._data_parallel_master_port_list = get_open_ports_list(5)
+                # 5 for the existing DP messaging channels, plus one rendezvous
+                # port per mergeable engine subset (`stateless_init_dp_subgroups`
+                # draws one for each, on every engine, to keep them aligned).
+                # Falling back to `data_parallel_master_port + 1` for these would
+                # hand out ports nobody checked were free.
+                self._data_parallel_master_port_list = get_open_ports_list(
+                    5 + len(ParallelConfig.dtp_merge_sets(self.data_parallel_size)))
             self.data_parallel_master_port = self._data_parallel_master_port_list.pop()
 
             if not (0 <= self.data_parallel_rank < self.data_parallel_size):

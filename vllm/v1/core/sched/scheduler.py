@@ -979,6 +979,12 @@ class Scheduler(SchedulerInterface):
         self.block_size *= dtp_size
         for i, manager in enumerate(self.kv_cache_manager.coordinator.single_type_managers):
             manager.block_size *= dtp_size
+        logger.info(
+            "[DTP] dp%s kv set: engines=%s dtp=%s block_size=%s spec_block=%s "
+            "spec_kv_heads=%s", self.dp_rank, self.long_request_engines, dtp_size,
+            self.block_size,
+            self.kv_cache_manager.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size,
+            self.kv_cache_manager.kv_cache_config.kv_cache_groups[0].kv_cache_spec.num_kv_heads)
     
     def kv_cache_config_reset(self,):
         dtp_size = len(self.long_request_engines)
@@ -998,6 +1004,12 @@ class Scheduler(SchedulerInterface):
         self.block_size //= dtp_size
         for _, manager in enumerate(self.kv_cache_manager.coordinator.single_type_managers):
             manager.block_size //= dtp_size
+        logger.info(
+            "[DTP] dp%s kv reset: engines=%s dtp=%s block_size=%s spec_block=%s "
+            "spec_kv_heads=%s", self.dp_rank, self.long_request_engines, dtp_size,
+            self.block_size,
+            self.kv_cache_manager.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size,
+            self.kv_cache_manager.kv_cache_config.kv_cache_groups[0].kv_cache_spec.num_kv_heads)
     
     def _schedule_long_request_exclusive(self) -> bool:
         """Schedule only the long request, preempting all other running requests."""
