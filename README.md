@@ -314,14 +314,22 @@ Flying Serving builds directly on **vLLM** and is informed by a line of work on 
 If you use this work, please cite:
 
 ```bibtex
-@misc{gao2026flyingservingontheflyparallelism,
-      title={FLYING SERVING: On-the-Fly Parallelism Switching for Large Language Model Serving},
-      author={Shouwei Gao and Junqi Yin and Feiyi Wang and Wenqian Dong},
-      year={2026},
-      eprint={2602.22593},
-      archivePrefix={arXiv},
-      primaryClass={cs.DC},
-      url={https://arxiv.org/abs/2602.22593},
+@inproceedings{flying2026,
+   author = {Gao, Shouwei and Yin, Junqi and Wang, Feiyi and Dong, Wenqian},
+   title = {FLYING SERVING: On-the-Fly Parallelism Switching for Large Language Model Serving},
+   year = {2026},
+   isbn = {9798400725227},
+   publisher = {Association for Computing Machinery},
+   address = {New York, NY, USA},
+   url = {https://doi.org/10.1145/3797905.3800525},
+   doi = {10.1145/3797905.3800525},
+   abstract = {Production LLM serving must simultaneously deliver high throughput, low latency, and sufficient context capacity under non-stationary traffic and mixed request requirements. Data parallelism (DP) maximizes throughput by running independent replicas, while tensor parallelism (TP) reduces per-request latency and pools memory for long-context inference. However, existing serving stacks typically commit to a static parallelism configuration at deployment; adapting to bursts, priorities, or long-context requests is often disruptive and slow. We present Flying Serving, a vLLM-based system that enables online DP-TP switching without restarting engine workers. Flying Serving makes reconfiguration practical by virtualizing the state that would otherwise force data movement: (i) a zero-copy Model Weights Manager that exposes TP shard views on demand, (ii) a KV Cache Adaptor that preserves request KV state across DP/TP layouts, (iii) an eagerly initialized Communicator Pool to amortize collective setup, and (iv) a deadlock-free scheduler that coordinates safe transitions under execution skew. Across three popular LLMs and realistic serving scenarios, Flying Serving improves performance by up to 4.79 \texttimes{} under high load and 3.47 \texttimes{} under low load while supporting latency- and memory-driven requests.},
+   booktitle = {Proceedings of the 40th ACM International Conference on Supercomputing},
+   pages = {17–29},
+   numpages = {13},
+   location = {
+   },
+   series = {ICS '26}
 }
 ```
 
